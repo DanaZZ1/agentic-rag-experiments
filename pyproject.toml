@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "production-agentic-rag"
+version = "0.1.0"
+description = "A provider-agnostic, production-grade agentic RAG system: hybrid retrieval, multi-hop planning, self-correction, guardrails, evaluation, and observability."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Chandan Swarup Swain" }]
+license = { text = "MIT" }
+keywords = ["rag", "agents", "llm", "retrieval", "genai", "evaluation"]
+dependencies = []
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+api = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "pydantic>=2.6"]
+gateway = ["mcp-tool-gateway @ git+https://github.com/chandanCoding/mcp-tool-gateway"]
+observability = ["llm-observability @ git+https://github.com/chandanCoding/llm-observability"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+prag = "production_agentic_rag.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

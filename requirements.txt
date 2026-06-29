@@ -1,0 +1,7 @@
+# Core has ZERO runtime dependencies — runs fully offline (deterministic MockLLM +
+# hashing embeddings, pure-Python BM25/RRF/rerank/eval).
+#
+# Optional extras:
+#   pip install ".[openai]"   # OpenAI / Azure OpenAI providers
+#   pip install ".[api]"      # FastAPI + Uvicorn service
+#   pip install ".[dev]"      # pytest
