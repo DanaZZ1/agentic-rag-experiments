@@ -20,6 +20,9 @@ def _build(corpus: Path) -> RAGPipeline:
 
 
 def cmd_ask(args: argparse.Namespace) -> None:
+    import os
+    if getattr(args, 'engine', None):
+        os.environ['RAG_ENGINE'] = args.engine
     pipe = _build(Path(args.corpus))
     res = pipe.query(args.question)
     print(json.dumps({"answer": res.answer, "citations": res.citations,
@@ -40,6 +43,7 @@ def main(argv: list[str] | None = None) -> None:
     a = sub.add_parser("ask", help="ask a question over the corpus")
     a.add_argument("question")
     a.add_argument("--corpus", default=str(_DEFAULT_CORPUS))
+    a.add_argument("--engine", choices=["agent", "langgraph"], default=None)
     a.set_defaults(func=cmd_ask)
 
     e = sub.add_parser("eval", help="run the evaluation harness")

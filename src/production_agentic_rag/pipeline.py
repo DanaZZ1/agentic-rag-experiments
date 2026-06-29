@@ -45,6 +45,21 @@ class RAGPipeline:
             model=("mock" if self.settings.llm_provider == "mock" else self.settings.llm_model),
             max_iterations=self.settings.max_iterations,
             faithfulness_threshold=self.settings.faithfulness_threshold)
+        self._engine = self._select_engine()
+
+    def _select_engine(self):
+        """Use the LangGraph engine if requested and installed, else the built-in agent."""
+        if self.settings.engine == "langgraph":
+            try:
+                from .graph import LangGraphRAG
+                return LangGraphRAG(
+                    llm=self.llm, tool=self.tool,
+                    model=("mock" if self.settings.llm_provider == "mock" else self.settings.llm_model),
+                    max_iterations=self.settings.max_iterations,
+                    faithfulness_threshold=self.settings.faithfulness_threshold)
+            except Exception:
+                pass  # fall back gracefully
+        return self.agent
 
     # ingestion ---------------------------------------------------------------
     def add_document(self, text: str, doc_id: str = "doc", strategy: str = "section") -> int:
@@ -65,7 +80,7 @@ class RAGPipeline:
             return QueryResult(question, f"Request blocked: {exc}", [], [], 0.0, 0,
                                blocked=True, trace=tracer.summary())
         with tracer.span("pipeline.query"):
-            agent_answer = self.agent.run(question, tracer=tracer)
+            agent_answer = self._engine.run(question, tracer=tracer)
             chunks_by_id = {r.chunk.id: r for h in agent_answer.hops for r in h.contexts}
             contexts = [chunks_by_id[c] for c in agent_answer.citations if c in chunks_by_id]
             answer, _ = redact_pii(agent_answer.answer)

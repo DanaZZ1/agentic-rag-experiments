@@ -23,6 +23,7 @@ class Settings:
     rerank: bool = field(default_factory=lambda: _env("RAG_RERANK", "1") == "1")
     # agent
     max_iterations: int = field(default_factory=lambda: int(_env("RAG_MAX_ITERS", "2")))
+    engine: str = field(default_factory=lambda: _env("RAG_ENGINE", "agent"))  # agent | langgraph
     faithfulness_threshold: float = field(default_factory=lambda: float(_env("RAG_FAITHFULNESS", "0.6")))
 
     @classmethod

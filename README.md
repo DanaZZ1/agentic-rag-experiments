@@ -48,6 +48,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 - **Observability** — hierarchical trace spans, token + USD cost accounting, latency.
 - **Interfaces** — `prag` CLI (`ask`, `eval`), FastAPI service (`/ask`, `/health`), Docker, CI matrix.
 - **Provider-agnostic** — `mock` (offline) ↔ `openai` ↔ `azure` via config/env.
+- **Pluggable engine** — the same plan→retrieve→generate→self-correct flow runs on the built-in agent **or a real LangGraph `StateGraph`** (`RAG_ENGINE=langgraph`).
 
 ## Quickstart (offline, no keys)
 
@@ -78,6 +79,18 @@ export AZURE_OPENAI_ENDPOINT=... AZURE_OPENAI_API_KEY=...
 prag ask "..."
 ```
 (see `.env.example` for all settings)
+
+## Engines (built-in vs LangGraph)
+The agentic flow runs on either engine — same nodes, same self-correction loop:
+
+```bash
+pip install ".[langgraph]"
+RAG_ENGINE=langgraph prag ask "what is the return window and how long do refunds take?"
+# or: prag ask "..." --engine langgraph
+```
+The LangGraph engine compiles a `StateGraph` (`plan → retrieve → generate` with a
+conditional edge back through `reformulate` when faithfulness < threshold). If
+LangGraph isn't installed, the pipeline falls back to the built-in agent automatically.
 
 ## Serve it
 ```bash
