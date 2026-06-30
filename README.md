@@ -116,8 +116,27 @@ See `examples/with_integrations.py`. Without these packages the core behaves ide
 
 ## Tests
 ```bash
-PYTHONPATH=src pytest -q          # 16 tests, fully offline
+PYTHONPATH=src pytest -q          # 20 tests, fully offline
 ```
+
+## Results (sample evaluation)
+Running the bundled harness (`prag eval`) over the sample corpus + 5-question
+labelled set, with the **offline deterministic engine** (no API keys):
+
+| Metric | Score |
+|--------|-------|
+| Retrieval hit@3 | 1.00 |
+| MRR | 1.00 |
+| Recall@3 | 1.00 |
+| nDCG@3 | 1.00 |
+| Faithfulness (mean) | 1.00 |
+| Answer token-F1 vs reference | 0.37 |
+
+> These numbers are on a small, clean sample with the extractive mock generator —
+> they validate the **pipeline and metrics**, not model quality. The lower answer-F1
+> reflects the mock returning whole grounded sentences vs. terse reference answers;
+> with a real LLM, expect higher answer-F1 and lower-but-realistic faithfulness.
+> Point `RAG_LLM_PROVIDER=azure` at your own corpus to get production-representative numbers.
 
 ## Project layout
 ```
@@ -135,8 +154,25 @@ production-agentic-rag/
 └── Dockerfile · Makefile · .github/workflows/ci.yml
 ```
 
+## Limitations & roadmap
+Being explicit about the boundaries — this is a reference implementation, not a hosted product:
+
+- **Local in-memory index.** The vector store is in-process; for scale, swap `VectorStore`
+  for a persistent backend (pgvector / Azure AI Search / FAISS) behind the same interface.
+- **Offline embeddings are lexical-ish.** `HashingEmbedder` is deterministic for tests/CI;
+  real semantic recall needs `OpenAIEmbedder` (or another dense model).
+- **Heuristic planner & reranker.** Query decomposition and reranking are rule-based by
+  default; the interfaces are LLM-ready (or cross-encoder-ready) drop-ins.
+- **Eval set is illustrative.** The bundled 5-question set proves the harness; real
+  evaluation needs a domain golden set and human-rated faithfulness.
+- **No streaming / multi-tenant auth yet.** The FastAPI service is single-tenant and
+  returns whole responses.
+
+**Roadmap:** persistent vector backend · cross-encoder reranker · streaming responses ·
+LLM-as-judge eval · per-tenant auth on the API · caching of full RAG responses.
+
 ## Tech
-Python 3.10+ · stdlib-only core · optional: `openai`, `fastapi`, `pytest` · Docker · GitHub Actions
+Python 3.10+ · stdlib-only core · optional: `openai`, `fastapi`, `langgraph`, `pytest` · Docker · GitHub Actions
 
 ## License
 MIT — see [LICENSE](LICENSE).
