@@ -11,9 +11,95 @@ from ..retrieval.hybrid import Scored
 from .planner import PlannedTask, plan
 from .tools import RetrievalTool
 
-_SYSTEM = ("Answer each task only from its supplied evidence. Return JSON with atomic claims. "
-          "Every factual claim must include entity, attribute, fact_ids, and exact evidence_refs. "
-          "The answer must be exactly the ordered claim texts; do not add uncited prose.")
+_SYSTEM = '''Answer each task only from its supplied evidence. Return exactly one JSON object matching this contract:
+
+{
+  "tasks": [
+    {
+      "task_id": "task_1",
+      "status": "supported",
+      "answer": "Returns are accepted within 30 days.",
+      "claims": [
+        {
+          "claim_id": "claim_fact_1",
+          "entity": "return_eligibility",
+          "attribute": "duration",
+          "text": "Returns are accepted within 30 days.",
+          "fact_ids": ["fact_1"],
+          "evidence_refs": [
+            {
+              "fact_id": "fact_1",
+              "chunk_id": "handbook:0",
+              "quote": "Returns are accepted within 30 days."
+            }
+          ]
+        }
+      ],
+      "evidence_refs": [
+        {
+          "fact_id": "fact_1",
+          "chunk_id": "handbook:0",
+          "quote": "Returns are accepted within 30 days."
+        }
+      ]
+    }
+  ]
+}
+
+Return one task object for every input task. Copy each input task's id exactly into task_id.
+The only allowed status values are "supported" and "not_in_corpus". Use "supported" only
+when the supplied evidence supports the answer. For "not_in_corpus", give an explicit
+abstention in answer and use empty claims and evidence_refs arrays.
+For supported tasks, answer must equal the ordered claim text joined with newlines. Every
+claim must have claim_id, entity, attribute, text, fact_ids, and evidence_refs. Each evidence
+reference must have fact_id, chunk_id, and an exact quote copied verbatim from that chunk.
+Use only fact IDs and chunk IDs supplied for that task. Include task-level evidence_refs as
+the union of the claim evidence references. Do not add prose outside the JSON object, do not
+use Markdown fences, and do not copy the example values unless they occur in the supplied evidence.'''
+
+
+class LLMOutputContractError(ValueError):
+    """Raised when a V3 completion cannot be mapped to the planned task contract."""
+
+
+def _strip_json_fence(text: str) -> str:
+    """Remove a single whole-response Markdown JSON fence, if present."""
+    import re
+
+    match = re.fullmatch(r"\s*```(?:json)?\s*\n?(.*?)\n?```\s*", text, re.I | re.S)
+    return match.group(1).strip() if match else text.strip()
+
+
+def _parse_generated_tasks(text: str, expected_task_ids: set[str]) -> dict[str, dict]:
+    """Parse and validate the task envelope before invoking evidence verification."""
+    try:
+        payload = json.loads(_strip_json_fence(text))
+    except json.JSONDecodeError as exc:
+        raise LLMOutputContractError(f"V3 completion is not valid JSON: {exc.msg}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
+        raise LLMOutputContractError('V3 completion must be an object with a "tasks" array')
+
+    generated_by_id: dict[str, dict] = {}
+    for index, task in enumerate(payload["tasks"]):
+        if not isinstance(task, dict):
+            raise LLMOutputContractError(f"V3 tasks[{index}] must be an object")
+        task_id = task.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            raise LLMOutputContractError(f"V3 tasks[{index}] is missing a non-empty task_id")
+        if task_id in generated_by_id:
+            raise LLMOutputContractError(f"V3 completion contains duplicate task_id {task_id!r}")
+        if task.get("status") not in ("supported", "not_in_corpus"):
+            raise LLMOutputContractError(
+                f"V3 task {task_id!r} has invalid status {task.get('status')!r}; "
+                'expected "supported" or "not_in_corpus"')
+        generated_by_id[task_id] = task
+
+    missing = sorted(expected_task_ids - generated_by_id.keys())
+    unexpected = sorted(generated_by_id.keys() - expected_task_ids)
+    if missing or unexpected:
+        raise LLMOutputContractError(
+            f"V3 task_id mismatch: missing={missing}, unexpected={unexpected}")
+    return generated_by_id
 
 
 @dataclass
@@ -130,11 +216,8 @@ class AgenticRAG:
                 with tracer.span("generate", round=round_no):
                     result = self.llm.complete(_SYSTEM, _build_prompt(question, payload_tasks))
                     tracer.record_usage(self.model, result.usage)
-                try:
-                    generated = json.loads(result.text).get("tasks", [])
-                except (json.JSONDecodeError, AttributeError):
-                    generated = []
-                generated_by_id = {str(x.get("task_id")): x for x in generated if isinstance(x, dict)}
+                expected_task_ids = set(pending)
+                generated_by_id = _parse_generated_tasks(result.text, expected_task_ids)
 
                 for tid in list(pending):
                     task = task_by_id[tid]

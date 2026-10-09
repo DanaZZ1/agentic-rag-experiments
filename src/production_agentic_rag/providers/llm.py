@@ -9,6 +9,71 @@ from typing import Protocol, runtime_checkable
 from ..text import sentences, tokenize
 
 
+_V3_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "rag_tasks_v3",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {"type": "string"},
+                            "status": {"type": "string", "enum": ["supported", "not_in_corpus"]},
+                            "answer": {"type": "string"},
+                            "claims": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "claim_id": {"type": "string"},
+                                        "entity": {"type": "string"},
+                                        "attribute": {"type": "string"},
+                                        "text": {"type": "string"},
+                                        "fact_ids": {"type": "array", "items": {"type": "string"}},
+                                        "evidence_refs": {
+                                            "type": "array",
+                                            "items": {"$ref": "#/$defs/evidence_ref"},
+                                        },
+                                    },
+                                    "required": ["claim_id", "entity", "attribute", "text",
+                                                 "fact_ids", "evidence_refs"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "evidence_refs": {
+                                "type": "array",
+                                "items": {"$ref": "#/$defs/evidence_ref"},
+                            },
+                        },
+                        "required": ["task_id", "status", "answer", "claims", "evidence_refs"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["tasks"],
+            "additionalProperties": False,
+            "$defs": {
+                "evidence_ref": {
+                    "type": "object",
+                    "properties": {
+                        "fact_id": {"type": "string"},
+                        "chunk_id": {"type": "string"},
+                        "quote": {"type": "string"},
+                    },
+                    "required": ["fact_id", "chunk_id", "quote"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    },
+}
+
+
 @dataclass
 class LLMResult:
     text: str
@@ -205,6 +270,8 @@ class OpenAILLM:
             model=self.model, temperature=0.0,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
+            **({"response_format": _V3_RESPONSE_FORMAT}
+               if user.startswith("RAG_TASKS_V3\n") else {}),
         )
         usage = resp.usage.model_dump() if resp.usage else {}
         return LLMResult(text=resp.choices[0].message.content or "", usage=usage)
