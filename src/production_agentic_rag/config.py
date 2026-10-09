@@ -12,9 +12,9 @@ def _env(key: str, default: str) -> str:
 class Settings:
     # providers
     llm_provider: str = field(default_factory=lambda: _env("RAG_LLM_PROVIDER", "mock"))
-    embed_provider: str = field(default_factory=lambda: _env("RAG_EMBED_PROVIDER", "hashing"))
+    embed_provider: str = field(default_factory=lambda: _env("RAG_EMBED_PROVIDER", "fastembed"))
     llm_model: str = field(default_factory=lambda: _env("RAG_LLM_MODEL", "gpt-4o-mini"))
-    embed_model: str = field(default_factory=lambda: _env("RAG_EMBED_MODEL", "text-embedding-3-small"))
+    embed_model: str = field(default_factory=lambda: _env("RAG_EMBED_MODEL", "BAAI/bge-small-en-v1.5"))
     # retrieval
     top_k: int = field(default_factory=lambda: int(_env("RAG_TOP_K", "4")))
     candidate_k: int = field(default_factory=lambda: int(_env("RAG_CANDIDATE_K", "12")))

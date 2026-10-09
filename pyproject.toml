@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 authors = [{ name = "Chandan Swarup Swain" }]
 license = { text = "MIT" }
 keywords = ["rag", "agents", "llm", "retrieval", "genai", "evaluation"]
-dependencies = []
+dependencies = ["fastembed>=0.7.0"]
 
 [project.optional-dependencies]
 openai = ["openai>=1.0"]

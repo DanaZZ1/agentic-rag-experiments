@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .agents.rag_agent import AgenticRAG
+from .agents.rag_agent import AgenticRAG, TaskAnswer
 from .agents.tools import RetrievalTool
 from .config import Settings
 from .guardrails import GuardrailReport, InputBlocked, check_input, grounding_score, redact_pii
@@ -25,10 +25,18 @@ class QueryResult:
     iterations: int
     blocked: bool = False
     trace: dict[str, Any] = field(default_factory=dict)
+    task_answers: list[TaskAnswer] = field(default_factory=list)
 
     @property
     def context_texts(self) -> list[str]:
         return [c.chunk.text for c in self.contexts]
+
+    @property
+    def coverage(self) -> dict[str, int]:
+        counts = {"supported": 0, "not_in_corpus": 0, "needs_retry": 0}
+        for item in self.task_answers:
+            counts[item.status] = counts.get(item.status, 0) + 1
+        return counts
 
 
 class RAGPipeline:
@@ -86,4 +94,5 @@ class RAGPipeline:
             answer, _ = redact_pii(agent_answer.answer)
             faith = grounding_score(answer, [c.chunk.text for c in contexts])
         return QueryResult(question, answer, agent_answer.citations, contexts,
-                           faith, agent_answer.iterations, trace=tracer.summary())
+                           faith, agent_answer.iterations, trace=tracer.summary(),
+                           task_answers=agent_answer.task_answers)

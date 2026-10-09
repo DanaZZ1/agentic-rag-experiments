@@ -2,15 +2,15 @@
 
 ## Design goals
 1. **Production concerns first** — planning, grounding, guardrails, evaluation, observability are first-class, not afterthoughts.
-2. **Provider-agnostic** — a one-line switch moves between an offline deterministic mock and OpenAI/Azure OpenAI.
-3. **Offline-deterministic** — the entire control flow (retrieval, fusion, agent loop, eval) is unit-testable with no network or keys.
+2. **Provider-agnostic** — a one-line switch selects local FastEmbed, deterministic hashing, or OpenAI embeddings, independently of the mock/OpenAI/Azure LLM.
+3. **Offline-deterministic** — the entire control flow (retrieval, fusion, agent loop, eval) is unit-testable with hashing and the mock LLM after dependencies are installed.
 4. **Swappable components** — every stage is a small module behind a clear interface.
 
 ## Components
 
 ### Providers (`providers/`)
 - `LLMProvider` protocol → `MockLLM` (extractive, deterministic), `OpenAILLM` (OpenAI/Azure).
-- `Embedder` protocol → `HashingEmbedder` (feature hashing, L2-normalised), `OpenAIEmbedder`.
+- `Embedder` protocol → `FastEmbedEmbedder` (local BAAI/bge-small-en-v1.5), `HashingEmbedder` (feature hashing, L2-normalised), `OpenAIEmbedder`.
 
 ### Ingestion (`ingestion/`)
 - Loaders for files/directories; chunkers: fixed-size sliding window (with overlap) and markdown-section.

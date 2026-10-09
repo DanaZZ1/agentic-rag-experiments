@@ -25,4 +25,7 @@ def test_multi_hop_citations():
 
 def test_single_hop_grounded():
     a = _agent().run("what does the warranty cover?")
-    assert "kb:2" in a.citations and "warranty" in a.answer.lower()
+    # This fixture states that electronics have a limited warranty, but says
+    # nothing about what it covers. The evidence-aware agent must abstain.
+    assert not a.citations
+    assert "not present in the corpus" in a.answer.lower()

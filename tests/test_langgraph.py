@@ -7,7 +7,7 @@ from production_agentic_rag.graph import HAS_LANGGRAPH
 def test_langgraph_engine_when_available():
     if not HAS_LANGGRAPH:
         return  # optional dependency not present
-    settings = Settings()
+    settings = Settings(embed_provider="hashing")
     settings.engine = "langgraph"
     pipe = RAGPipeline(settings)
     pipe.add_document("# Returns\nUnused items can be returned within 30 days for a full refund.", doc_id="kb")
@@ -18,6 +18,6 @@ def test_langgraph_engine_when_available():
 
 def test_pipeline_defaults_to_builtin_engine():
     # default engine is the built-in agent; must work with no extra deps
-    pipe = RAGPipeline()
+    pipe = RAGPipeline(Settings(embed_provider="hashing"))
     pipe.add_document("# A\nalpha beta gamma delta", doc_id="d")
     assert pipe.query("alpha").answer

@@ -16,6 +16,8 @@ class RetrievalTool:
     name: str = "search_knowledge_base"
     description: str = "Search the indexed corpus and return the most relevant chunks."
 
-    def __call__(self, query: str) -> list[Scored]:
-        return self.retriever.retrieve(query, k=self.k,
-                                       candidate_k=self.candidate_k, rerank=self.rerank)
+    def __call__(self, query: str, *, k: int | None = None,
+                 candidate_k: int | None = None) -> list[Scored]:
+        return self.retriever.retrieve(query, k=k or self.k,
+                                       candidate_k=candidate_k or self.candidate_k,
+                                       rerank=self.rerank)

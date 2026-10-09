@@ -2,10 +2,11 @@
 
 A **provider-agnostic, production-grade agentic RAG system** — ingestion, hybrid
 retrieval, a self-correcting multi-hop agent, guardrails, a real evaluation harness,
-and built-in observability. The **core has zero runtime dependencies and runs fully
-offline** (deterministic mock LLM + hashing embeddings), so the whole pipeline —
-including its faithfulness gate and eval metrics — is CI-testable without API keys.
-Swap one setting to run on **OpenAI or Azure OpenAI**.
+and built-in observability. The default configuration uses a deterministic mock LLM
+and local FastEmbed embeddings (`BAAI/bge-small-en-v1.5`), with no paid API required.
+FastEmbed downloads the model on first use; after that inference is local. Select
+`RAG_EMBED_PROVIDER=hashing` for the deterministic embedding baseline. Swap provider
+settings to run on **OpenAI or Azure OpenAI**.
 
 [![CI](https://github.com/chandanCoding/production-agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/chandanCoding/production-agentic-rag/actions)
 
@@ -30,7 +31,7 @@ This project implements those concerns as clean, swappable components.
                          │        │     → RRF fuse → rerank)        │                            │
                          │        │  → synthesize (LLM) → score     │                            │
                          │        └─────────────────────────────────┘                            │
-                         │  cross-cutting:  providers (mock|openai|azure)  ·  Tracer (spans, tokens, cost) │
+                         │  cross-cutting: providers (mock|FastEmbed|hashing|OpenAI) · Tracer (spans, tokens, cost) │
                          └──────────────────────────────────────────────────────────────────────┘
                                                    │
                                         evaluation harness
@@ -47,10 +48,10 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 - **Evaluation** — labelled-dataset harness: hit@k, MRR, recall@k, nDCG, faithfulness, answer token-F1.
 - **Observability** — hierarchical trace spans, token + USD cost accounting, latency.
 - **Interfaces** — `prag` CLI (`ask`, `eval`), FastAPI service (`/ask`, `/health`), Docker, CI matrix.
-- **Provider-agnostic** — `mock` (offline) ↔ `openai` ↔ `azure` via config/env.
+- **Provider-agnostic** — `mock` LLM and `fastembed` (local), `hashing` (baseline), or `openai` embeddings via config/env.
 - **Pluggable engine** — the same plan→retrieve→generate→self-correct flow runs on the built-in agent **or a real LangGraph `StateGraph`** (`RAG_ENGINE=langgraph`).
 
-## Quickstart (offline, no keys)
+## Quickstart (local model, no API keys)
 
 ```bash
 pip install -e ".[dev]"          # or just: PYTHONPATH=src ...
@@ -61,7 +62,10 @@ prag ask "what is the return window and how long do refunds take?"
 prag eval --k 3                  # runs the evaluation harness over data/eval/qa.jsonl
 ```
 
-Example `ask` output (offline):
+The first run downloads the FastEmbed model. To run with the deterministic hashing
+baseline instead, prefix a command with `RAG_EMBED_PROVIDER=hashing`.
+
+Example `ask` output (local model; no API keys):
 ```json
 {
   "answer": "Customers may return any unused item within 30 days ... Approved refunds are issued ... within 5 business days ...",
@@ -120,8 +124,9 @@ PYTHONPATH=src pytest -q          # 20 tests, fully offline
 ```
 
 ## Results (sample evaluation)
-Running the bundled harness (`prag eval`) over the sample corpus + 5-question
-labelled set, with the **offline deterministic engine** (no API keys):
+Running the bundled harness (`RAG_EMBED_PROVIDER=hashing prag eval --k 3`) over the
+sample corpus and 5-question labeled set, with the deterministic hashing embedder
+and mock LLM (no API keys):
 
 | Metric | Score |
 |--------|-------|
@@ -159,8 +164,8 @@ Being explicit about the boundaries — this is a reference implementation, not 
 
 - **Local in-memory index.** The vector store is in-process; for scale, swap `VectorStore`
   for a persistent backend (pgvector / Azure AI Search / FAISS) behind the same interface.
-- **Offline embeddings are lexical-ish.** `HashingEmbedder` is deterministic for tests/CI;
-  real semantic recall needs `OpenAIEmbedder` (or another dense model).
+- **The hashing baseline is lexical-ish.** `HashingEmbedder` is deterministic for
+  tests/CI; the default FastEmbed model provides local semantic embeddings.
 - **Heuristic planner & reranker.** Query decomposition and reranking are rule-based by
   default; the interfaces are LLM-ready (or cross-encoder-ready) drop-ins.
 - **Eval set is illustrative.** The bundled 5-question set proves the harness; real
@@ -172,7 +177,7 @@ Being explicit about the boundaries — this is a reference implementation, not 
 LLM-as-judge eval · per-tenant auth on the API · caching of full RAG responses.
 
 ## Tech
-Python 3.10+ · stdlib-only core · optional: `openai`, `fastapi`, `langgraph`, `pytest` · Docker · GitHub Actions
+Python 3.10+ · FastEmbed/ONNX Runtime · optional: `openai`, `fastapi`, `langgraph`, `pytest` · Docker · GitHub Actions
 
 ## License
 MIT — see [LICENSE](LICENSE).

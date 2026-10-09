@@ -8,7 +8,7 @@ EVAL = Path(__file__).resolve().parents[1] / "data" / "eval" / "qa.jsonl"
 
 
 def _pipe():
-    p = RAGPipeline(Settings())
+    p = RAGPipeline(Settings(embed_provider="hashing"))
     p.add_documents(load_directory(CORPUS))
     return p
 

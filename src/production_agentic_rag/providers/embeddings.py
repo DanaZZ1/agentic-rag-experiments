@@ -1,4 +1,4 @@
-"""Embedding providers: deterministic offline hashing + real OpenAI/Azure adapters."""
+"""Embedding providers: local FastEmbed, deterministic hashing, and OpenAI/Azure."""
 from __future__ import annotations
 import hashlib
 import math
@@ -34,6 +34,23 @@ class HashingEmbedder:
         return {k: v / norm for k, v in vec.items()}
 
 
+class FastEmbedEmbedder:
+    """Local semantic embeddings via FastEmbed and ONNX Runtime."""
+
+    def __init__(self, model: str = "BAAI/bge-small-en-v1.5") -> None:
+        from fastembed import TextEmbedding  # lazy import
+
+        self.model = model
+        self._embedding_model = TextEmbedding(model_name=model)
+        self.dim = self._embedding_model.embedding_size
+
+    def embed(self, text: str) -> dict[int, float]:
+        values = next(iter(self._embedding_model.embed([text])))
+        vec = [float(value) for value in values]
+        norm = math.sqrt(sum(value * value for value in vec)) or 1.0
+        return {i: value / norm for i, value in enumerate(vec)}
+
+
 class OpenAIEmbedder:
     """Real dense embeddings (OpenAI or Azure OpenAI via the same SDK)."""
 
@@ -51,6 +68,10 @@ class OpenAIEmbedder:
 
 
 def build_embedder(provider: str, model: str) -> Embedder:
+    if provider == "hashing":
+        return HashingEmbedder()
+    if provider == "fastembed":
+        return FastEmbedEmbedder(model)
     if provider == "openai":
         return OpenAIEmbedder(model)
     return HashingEmbedder()
