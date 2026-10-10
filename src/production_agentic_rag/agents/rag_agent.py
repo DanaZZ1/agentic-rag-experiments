@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 
-from ..guardrails import grounding_score, typed_value_request, verify_task_answer
+from ..guardrails import (EvidenceVerification, bind_evidence_references, grounding_score,
+                          typed_value_request, verify_task_answer)
 from ..observability import Tracer
 from ..providers.llm import LLMProvider
 from ..retrieval.hybrid import Scored
@@ -51,11 +52,21 @@ The only allowed status values are "supported" and "not_in_corpus". Use "support
 when the supplied evidence supports the answer. For "not_in_corpus", give an explicit
 abstention in answer and use empty claims and evidence_refs arrays.
 For supported tasks, answer must equal the ordered claim text joined with newlines. Every
-claim must have claim_id, entity, attribute, text, fact_ids, and evidence_refs. Each evidence
-reference must have fact_id, chunk_id, and an exact quote copied verbatim from that chunk.
-Use only fact IDs and chunk IDs supplied for that task. Include task-level evidence_refs as
-the union of the claim evidence references. Do not add prose outside the JSON object, do not
-use Markdown fences, and do not copy the example values unless they occur in the supplied evidence.'''
+claim must have claim_id, entity, attribute, text, fact_ids, and evidence_refs. Copy entity
+and attribute exactly from the associated planned required_fact. Entity means the fact's
+subject; attribute means the requested relation/property. Never infer labels from your answer
+or change them to fit a passage. A fact marked verifiable=false must not be answered as
+supported. Each evidence reference must have fact_id, chunk_id, and a candidate source quote.
+Keep each quote to one contiguous source span; use separate references for separate source
+sentences. The runtime resolves quotes only against chunks retrieved for that fact and
+replaces both chunk_id and quote with exact source values. Do not concatenate distant text,
+paraphrase quotes, or guess IDs. For comparisons, include one evidence-linked claim per
+operand plus a comparison claim with entity="comparison", the planned comparison
+claim_attribute, both operand fact IDs, and evidence refs for both. Do not give a yes/no
+conclusion when either operand or its comparison value is absent. For not_in_corpus, use a
+clear plain-language refusal (including "There is no evidence to determine...") and empty
+claims and evidence_refs arrays. Do not add prose outside the JSON object, use Markdown fences,
+or copy example values.'''
 
 
 class LLMOutputContractError(ValueError):
@@ -207,6 +218,8 @@ class AgenticRAG:
                         for fact in task.required_facts:
                             chunk_list = list(retrieved[tid][fact.id].values())
                             evidence_groups.append({"fact_id": fact.id,
+                                "entity": fact.entity, "entity_aliases": fact.entity_aliases,
+                                "attribute": fact.attribute, "verifiable": fact.verifiable,
                                 "query": fact.retrieval_query,
                                 "chunks": [{"chunk_id": r.chunk.id, "text": r.chunk.text} for r in chunk_list]})
                         td = _task_dict(task)
@@ -224,12 +237,26 @@ class AgenticRAG:
                     raw = generated_by_id.get(tid, {})
                     per_task_chunks = {cid: item.chunk.text for fact_chunks in retrieved[tid].values()
                                        for cid, item in fact_chunks.items()}
-                    verification = verify_task_answer(_task_dict(task), raw, per_task_chunks,
-                                                      require_claims=True)
+                    retrieved_by_fact = {
+                        fid: {cid: item.chunk.text for cid, item in fact_chunks.items()}
+                        for fid, fact_chunks in retrieved[tid].items()
+                    }
+                    candidate = raw
+                    binding_error = ""
+                    if raw.get("status") == "supported":
+                        binding = bind_evidence_references(_task_dict(task), raw, retrieved_by_fact)
+                        candidate, binding_error = binding.candidate, binding.reason
+                    if binding_error:
+                        verification = EvidenceVerification("needs_retry", str(raw.get("answer", "")),
+                                                            [], binding_error)
+                    else:
+                        verification = verify_task_answer(_task_dict(task), candidate, per_task_chunks,
+                                                          require_claims=True,
+                                                          retrieved_by_fact=retrieved_by_fact)
                     if verification.status in ("supported", "not_in_corpus"):
                         valid_claims = []
                         if verification.status == "supported":
-                            for claim in raw.get("claims", []):
+                            for claim in candidate.get("claims", []):
                                 valid_claims.append(Claim(
                                     claim_id=str(claim.get("claim_id", "")),
                                     entity=str(claim.get("entity", "unknown")),

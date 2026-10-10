@@ -110,10 +110,11 @@ class MockLLM:
                 "unknown": (),
             }
 
-            def mentions(entity: str, text: str) -> bool:
-                aliases = entity_aliases.get(entity, (entity.replace("_", " "),))
-                return entity == "unknown" or any(
-                    re.search(r"\b" + re.escape(alias) + r"\b", text.lower()) for alias in aliases)
+            def mentions(entity: str, text: str, supplied=()) -> bool:
+                aliases = tuple(str(x) for x in supplied) or entity_aliases.get(entity, (entity.replace("_", " "),))
+                if entity in ("unknown", "unresolved"):
+                    return False
+                return any(re.search(r"\b" + re.escape(alias) + r"\b", text.lower()) for alias in aliases)
 
             def find_duration(text: str):
                 m = re.search(r"\b(\d+)(?:\s*-\s*(\d+))?\s+business days?\b", text, re.I)
@@ -125,17 +126,20 @@ class MockLLM:
                 fact_quotes: dict[str, tuple[dict, str, dict]] = {}
                 for fact in task.get("required_facts", []):
                     fid = str(fact["id"])
+                    if not fact.get("verifiable", False):
+                        continue
                     group = next((g for g in task.get("evidence", []) if g.get("fact_id") == fid), {})
                     entity = str(fact.get("entity", "unknown"))
                     query_terms = set(tokenize(" ".join((fact.get("retrieval_query", ""), entity,
-                                                          fact.get("attribute", ""), fact.get("description", "")))))
+                                                          fact.get("attribute", ""), fact.get("description", ""),
+                                                          " ".join(fact.get("entity_aliases", []))))))
                     choices = []
                     for chunk in group.get("chunks", []):
                         # Remove headings for selection while retaining exact source substrings.
                         text = re.sub(r"(?m)^#{1,6}[^\n]*(?:\n|$)", "", chunk.get("text", ""))
                         for match in re.finditer(r"[^.!?]+[.!?]?", text):
                             quote = match.group(0).strip()
-                            if not quote or not mentions(entity, quote):
+                            if not quote or not mentions(entity, quote, fact.get("entity_aliases", [])):
                                 continue
                             overlap = len(query_terms & set(tokenize(quote)))
                             if overlap:
@@ -163,21 +167,51 @@ class MockLLM:
                     left_id, right_id = str(comparison["left_fact_id"]), str(comparison["right_fact_id"])
                     left_item, right_item = fact_quotes.get(left_id), fact_quotes.get(right_id)
                     if left_item and right_item:
-                        left_duration, right_duration = find_duration(left_item[1]), find_duration(right_item[1])
-                        if left_duration and right_duration:
-                            left_label, right_label = str(comparison["left_label"]), str(comparison["right_label"])
-                            if left_duration[0] > right_duration[1]:
-                                relation = f"{left_label.capitalize()} takes longer than {right_label}."
-                            elif left_duration[1] < right_duration[0]:
-                                relation = f"{left_label.capitalize()} does not take longer than {right_label}; it is shorter."
+                        left_label, right_label = str(comparison["left_label"]), str(comparison["right_label"])
+                        if comparison.get("kind") == "duration":
+                            left_duration, right_duration = find_duration(left_item[1]), find_duration(right_item[1])
+                            if left_duration and right_duration:
+                                if left_duration[0] > right_duration[1]:
+                                    relation = f"{left_label.capitalize()} takes longer than {right_label}."
+                                elif left_duration[1] < right_duration[0]:
+                                    relation = f"{left_label.capitalize()} does not take longer than {right_label}; it is shorter."
+                                else:
+                                    relation = f"The durations of {left_label} and {right_label} overlap, so neither is consistently longer."
                             else:
-                                relation = f"The durations of {left_label} and {right_label} overlap, so neither is consistently longer."
+                                relation = ""
+                        else:
+                            attr = str(comparison.get("attribute", ""))
+                            def value(quote: str):
+                                if attr == "nationality":
+                                    found = re.findall(r"\b(american|british|canadian|french|german|italian|japanese|turkish|australian|irish|spanish|indian|chinese)\b", quote, re.I)
+                                    return found[-1].lower() if found else None
+                                if attr in ("neighborhood", "location"):
+                                    found = re.findall(r"\b(?:in|at)\s+([A-Z][\w’'-]+(?:\s+[A-Z][\w’'-]+)?)\s+(?:neighbou?rhood|district)\b", quote, re.I)
+                                    if not found and attr == "neighborhood":
+                                        found = re.findall(r"\b(?:located|situated)\s+in\s+([A-Z][\w’'-]+)", quote, re.I)
+                                    if not found:
+                                        found = re.findall(r"\b(?:located|situated)\s+(?:in|at)\s+([^,.;]+)", quote, re.I)
+                                    vals = [(x if isinstance(x, str) else (x[0] or x[1])).strip().lower() if isinstance(x, tuple) else x.strip().lower() for x in found]
+                                    return vals[-1] if vals else None
+                                return None
+                            left_value, right_value = value(left_item[1]), value(right_item[1])
+                            if left_value and right_value:
+                                same = left_value == right_value
+                                if comparison.get("operator") == "same":
+                                    relation = (f"{left_label} and {right_label} are in the same {attr}." if same
+                                                else f"{left_label} and {right_label} are not in the same {attr}.")
+                                else:
+                                    relation = (f"{left_label} and {right_label} are different in {attr}." if not same
+                                                else f"{left_label} and {right_label} are the same in {attr}.")
+                            else:
+                                relation = ""
+                        if relation:
                             refs = [left_item[2], right_item[2]]
                             claims.append({"claim_id": "claim_comparison", "entity": "comparison",
-                                           "attribute": "duration_relation", "text": relation,
+                                           "attribute": str(comparison.get("claim_attribute", "duration_relation")), "text": relation,
                                            "fact_ids": [left_id, right_id], "evidence_refs": refs})
 
-                if claims:
+                if claims and (not task.get("comparison") or any(c.get("entity") == "comparison" for c in claims)):
                     answer = "\n".join(claim["text"] for claim in claims)
                     outputs.append({"task_id": task["id"], "status": "supported", "answer": answer,
                                     "claims": claims, "evidence_refs": flat_refs})
