@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 
-from ..guardrails import (EvidenceVerification, bind_evidence_references, grounding_score,
+from ..guardrails import (EvidenceVerification, bind_evidence_references,
+                          classify_verification_failure, grounding_score,
                           typed_value_request, verify_task_answer)
 from ..observability import Tracer
 from ..providers.llm import LLMProvider
@@ -66,7 +67,10 @@ claim_attribute, both operand fact IDs, and evidence refs for both. Do not give 
 conclusion when either operand or its comparison value is absent. For not_in_corpus, use a
 clear plain-language refusal (including "There is no evidence to determine...") and empty
 claims and evidence_refs arrays. Do not add prose outside the JSON object, use Markdown fences,
-or copy example values.'''
+or copy example values. If a task contains retry_guidance, address that specific failure.
+Reuse supplied evidence for contract, citation, entity/attribute, and comparison repairs;
+do not claim evidence is absent when it is present. Request/retrieve more evidence only when
+the guidance says evidence is insufficient.'''
 
 
 class LLMOutputContractError(ValueError):
@@ -140,6 +144,7 @@ class TaskAnswer:
     retries: int = 0
     missing_fact_ids: list[str] = field(default_factory=list)
     claims: list[Claim] = field(default_factory=list)
+    failure_type: str = ""
 
 
 @dataclass
@@ -158,6 +163,7 @@ class AgentAnswer:
     iterations: int
     citations: list[str] = field(default_factory=list)
     task_answers: list[TaskAnswer] = field(default_factory=list)
+    diagnostics: list[dict] = field(default_factory=list)
 
 
 def _task_dict(task: PlannedTask) -> dict:
@@ -184,6 +190,7 @@ class AgenticRAG:
             t.id: {fact.id: {} for fact in t.required_facts} for t in tasks}
         attempts: dict[str, int] = {t.id: 0 for t in tasks}
         verified: dict[str, TaskAnswer] = {}
+        diagnostics: list[dict] = []
         pending = {t.id for t in tasks}
         task_by_id = {t.id: t for t in tasks}
         iterations = 0
@@ -194,14 +201,19 @@ class AgenticRAG:
                     break
                 iterations = round_no
                 payload_tasks = []
+                retrieval_performed_tasks: set[str] = set()
                 with tracer.span("plan", round=round_no):
                     for tid in list(pending):
                         task = task_by_id[tid]
                         failed = verified.get(tid)
+                        # Retrieve on the initial attempt and only when verification
+                        # says the available evidence is insufficient. Contract,
+                        # citation, and comparison repairs reuse the current corpus view.
+                        retrieve_again = failed is None or failed.failure_type == "insufficient_evidence"
                         fact_ids = set(failed.missing_fact_ids) if failed else set()
-                        # Retry only the failed task, using its specific missing-fact guidance.
                         target_facts = [f for f in task.required_facts if not fact_ids or f.id in fact_ids]
-                        for fact in target_facts:
+                        for fact in target_facts if retrieve_again else []:
+                            retrieval_performed_tasks.add(tid)
                             retry_query = fact.retrieval_query
                             if failed and failed.reason:
                                 retry_query = f"{fact.retrieval_query} {fact.description} {failed.reason}"
@@ -224,13 +236,32 @@ class AgenticRAG:
                                 "chunks": [{"chunk_id": r.chunk.id, "text": r.chunk.text} for r in chunk_list]})
                         td = _task_dict(task)
                         td["evidence"] = evidence_groups
+                        if failed:
+                            td["retry_guidance"] = {
+                                "failure_type": failed.failure_type,
+                                "reason": failed.reason,
+                                "action": _retry_action(failed.failure_type),
+                                "retrieval_performed": retrieve_again,
+                            }
                         payload_tasks.append(td)
 
                 with tracer.span("generate", round=round_no):
                     result = self.llm.complete(_SYSTEM, _build_prompt(question, payload_tasks))
                     tracer.record_usage(self.model, result.usage)
                 expected_task_ids = set(pending)
-                generated_by_id = _parse_generated_tasks(result.text, expected_task_ids)
+                try:
+                    generated_by_id = _parse_generated_tasks(result.text, expected_task_ids)
+                except LLMOutputContractError as exc:
+                    for tid in list(pending):
+                        attempts[tid] += 1
+                        verified[tid] = TaskAnswer(tid, "needs_retry", "", [], str(exc),
+                                                   attempts[tid], failure_type="output_contract")
+                        diagnostics.append({"round": round_no, "task_id": tid, "phase": "output_contract",
+                                            "status": "failed", "failure_type": "output_contract",
+                                            "reason": str(exc), "retry_action": "regenerate_from_existing_evidence",
+                                            "retrieval_performed": tid in retrieval_performed_tasks,
+                                            "verifier_invoked": False})
+                    continue
 
                 for tid in list(pending):
                     task = task_by_id[tid]
@@ -248,11 +279,23 @@ class AgenticRAG:
                         candidate, binding_error = binding.candidate, binding.reason
                     if binding_error:
                         verification = EvidenceVerification("needs_retry", str(raw.get("answer", "")),
-                                                            [], binding_error)
+                                                            [], binding_error,
+                                                            failure_type=binding.failure_type or "invalid_citation")
+                        phase = "binding"
                     else:
                         verification = verify_task_answer(_task_dict(task), candidate, per_task_chunks,
                                                           require_claims=True,
                                                           retrieved_by_fact=retrieved_by_fact)
+                        phase = "verifier"
+                        if verification.status == "needs_retry" and not verification.failure_type:
+                            verification.failure_type = classify_verification_failure(verification.reason)
+                    diagnostics.append({"round": round_no, "task_id": tid, "phase": phase,
+                                        "status": verification.status,
+                                        "failure_type": verification.failure_type,
+                                        "reason": verification.reason,
+                                        "retry_action": _retry_action(verification.failure_type),
+                                        "retrieval_performed": tid in retrieval_performed_tasks,
+                                        "verifier_invoked": phase == "verifier"})
                     if verification.status in ("supported", "not_in_corpus"):
                         valid_claims = []
                         if verification.status == "supported":
@@ -273,18 +316,34 @@ class AgenticRAG:
                         attempts[tid] += 1
                         verified[tid] = TaskAnswer(tid, "needs_retry", raw.get("answer", ""),
                             [EvidenceRef(**ref) for ref in verification.evidence_refs],
-                            verification.reason, attempts[tid], verification.missing_fact_ids or [])
+                            verification.reason, attempts[tid], verification.missing_fact_ids or [],
+                            failure_type=verification.failure_type or classify_verification_failure(verification.reason))
 
         # Never expose an unverified candidate when the bounded retry budget is exhausted.
         for tid in pending:
             task = task_by_id[tid]
             verified[tid] = TaskAnswer(tid, "not_in_corpus",
                 f"The requested information is not present in the corpus: {task.question}", [],
-                verified[tid].reason if tid in verified else "Verification did not pass", attempts[tid])
+                verified[tid].reason if tid in verified else "Verification did not pass", attempts[tid],
+                failure_type=verified[tid].failure_type if tid in verified else "verification_failure")
         ordered = [verified[t.id] for t in tasks]
         answer_parts = [ta.answer for ta in ordered]
         final_answer = "\n".join(answer_parts)
         citations = list(dict.fromkeys(ref.chunk_id for ta in ordered if ta.status == "supported" for ref in ta.evidence_refs))
         all_contexts = [r.chunk.text for h in hops for r in h.contexts]
         faith = grounding_score(final_answer, all_contexts)
-        return AgentAnswer(question, final_answer, hops, faith, iterations, citations, ordered)
+        return AgentAnswer(question, final_answer, hops, faith, iterations, citations, ordered, diagnostics)
+
+
+def _retry_action(failure_type: str) -> str:
+    if not failure_type:
+        return "none"
+    if failure_type in ("output_contract", "missing_evidence_reference", "invalid_citation",
+                        "ambiguous_citation", "incorrect_fact_association", "comparison_structure",
+                        "entity_attribute_mismatch"):
+        return "regenerate_from_existing_evidence"
+    if failure_type == "insufficient_evidence":
+        return "reformulate_retrieval_query"
+    if failure_type in ("unsupported_claim", "contradictory_evidence"):
+        return "recheck_claim_against_existing_evidence"
+    return "retry_with_existing_evidence"

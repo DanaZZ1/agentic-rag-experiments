@@ -61,12 +61,14 @@ class EvidenceVerification:
     evidence_refs: list[dict[str, str]]
     reason: str = ""
     missing_fact_ids: list[str] | None = None
+    failure_type: str = ""
 
 
 @dataclass
 class EvidenceBinding:
     candidate: dict[str, Any]
     reason: str = ""
+    failure_type: str = ""
 
 
 def _normalize_evidence_text(text: str) -> list[re.Match[str]]:
@@ -103,62 +105,65 @@ def bind_evidence_references(task: dict[str, Any], candidate: dict[str, Any],
     normalized = dict(candidate)
     claims = candidate.get("claims")
     if not isinstance(claims, list):
-        return EvidenceBinding(normalized, "Structured claim list is required")
+        return EvidenceBinding(normalized, "Structured claim list is required", "output_contract")
     facts = {str(f.get("id")): f for f in task.get("required_facts", [])}
     bound_claims: list[dict[str, Any]] = []
     all_refs: list[dict[str, str]] = []
     for claim in claims:
         if not isinstance(claim, dict):
-            return EvidenceBinding(normalized, "Malformed claim")
+            return EvidenceBinding(normalized, "Malformed claim", "output_contract")
         fact_ids = [str(fid) for fid in claim.get("fact_ids", [])]
         refs = claim.get("evidence_refs")
         if not fact_ids or not isinstance(refs, list) or not refs:
-            return EvidenceBinding(normalized, "Claim is missing fact association or evidence hints")
+            return EvidenceBinding(normalized, "Claim is missing fact association or evidence hints", "missing_evidence_reference")
         if any(fid not in facts for fid in fact_ids):
-            return EvidenceBinding(normalized, "Claim references an unplanned fact")
+            return EvidenceBinding(normalized, "Claim references an unplanned fact", "incorrect_fact_association")
         bound_refs: list[dict[str, str]] = []
         for ref in refs:
             if not isinstance(ref, dict):
-                return EvidenceBinding(normalized, "Malformed evidence hint")
+                return EvidenceBinding(normalized, "Malformed evidence hint", "invalid_citation")
             fid = str(ref.get("fact_id", ""))
             hint_id = str(ref.get("chunk_id", ""))
             quote = str(ref.get("quote", "")).strip()
             if fid not in fact_ids or fid not in facts:
-                return EvidenceBinding(normalized, "Evidence hint is linked to the wrong fact")
+                return EvidenceBinding(normalized, "Evidence hint is linked to the wrong fact", "incorrect_fact_association")
             chunks = retrieved_by_fact.get(fid, {})
             if not chunks:
-                return EvidenceBinding(normalized, f"No retrieved chunks are associated with fact {fid!r}")
+                return EvidenceBinding(normalized, f"No retrieved chunks are associated with fact {fid!r}", "insufficient_evidence")
             if not quote:
-                return EvidenceBinding(normalized, "Evidence hint contains no source text")
-            exact_matches = [(cid, quote) for cid, text in chunks.items() if quote in text]
+                return EvidenceBinding(normalized, "Evidence hint contains no source text", "invalid_citation")
+            if not hint_id or hint_id not in chunks:
+                return EvidenceBinding(normalized, f"Evidence chunk ID {hint_id!r} was not retrieved", "invalid_citation")
+            if quote not in chunks[hint_id] and not _source_spans(quote, chunks[hint_id]):
+                if len(_sentence_candidates(quote)) > 1:
+                    return EvidenceBinding(normalized,
+                        "Evidence quote combines non-contiguous or non-verbatim text; provide separate references",
+                        "invalid_citation")
+                return EvidenceBinding(normalized,
+                                       f"Evidence span not found in supplied chunk {hint_id!r}",
+                                       "invalid_citation")
+            exact_matches = [(hint_id, quote)] if quote in chunks[hint_id] else []
             candidates = exact_matches or [
-                (cid, source_quote) for cid, text in chunks.items()
-                for source_quote in _source_spans(quote, text)]
-            # A valid supplied ID disambiguates identical spans, but never
-            # overrides whether the span occurs in that retrieved chunk.
-            if hint_id and hint_id in chunks:
-                hinted = [item for item in candidates if item[0] == hint_id]
-                if hinted:
-                    candidates = hinted
+                (hint_id, source_quote) for source_quote in _source_spans(quote, chunks[hint_id])]
             unique = list(dict.fromkeys(candidates))
             if not unique:
                 if len(_sentence_candidates(quote)) > 1:
                     reason = "Evidence quote combines non-contiguous or non-verbatim text; provide separate references"
                 else:
                     reason = f"Evidence span not found in retrieved chunks for fact {fid!r}"
-                return EvidenceBinding(normalized, reason)
+                return EvidenceBinding(normalized, reason, "invalid_citation")
             chunk_ids = {cid for cid, _ in unique}
             if len(chunk_ids) != 1:
                 return EvidenceBinding(normalized,
-                    f"Evidence span is ambiguous across retrieved chunks for fact {fid!r}")
+                    f"Evidence span is ambiguous across retrieved chunks for fact {fid!r}", "ambiguous_citation")
             cid = next(iter(chunk_ids))
             source_quotes = list(dict.fromkeys(q for found_id, q in unique if found_id == cid))
             if len(source_quotes) != 1:
                 return EvidenceBinding(normalized,
-                    f"Evidence span is ambiguous within retrieved chunk {cid!r}")
+                    f"Evidence span is ambiguous within retrieved chunk {cid!r}", "ambiguous_citation")
             bound_refs.append({"fact_id": fid, "chunk_id": cid, "quote": source_quotes[0]})
         if not bound_refs:
-            return EvidenceBinding(normalized, "Claim has no source-resolved evidence")
+            return EvidenceBinding(normalized, "Claim has no source-resolved evidence", "missing_evidence_reference")
         # Deduplicate refs without combining source passages.
         claim_copy = dict(claim)
         claim_copy["evidence_refs"] = list({(r["fact_id"], r["chunk_id"], r["quote"]): r for r in bound_refs}.values())
@@ -187,6 +192,29 @@ def _explicit_abstention(answer: str) -> bool:
         r"insufficient information|does not contain|doesn't contain|"
         r"(?:the )?(?:available )?(?:evidence|information|text|passages|context)\s+does not provide|"
         r"no evidence found)\b", answer, re.I))
+
+
+def classify_verification_failure(reason: str) -> str:
+    """Classify deterministic check failures for diagnostics and retry policy."""
+    value = reason.casefold()
+    if any(term in value for term in ("missing evidence", "required fact", "does not contain the required",
+                                      "no retrieved chunks", "number absent from evidence")):
+        return "insufficient_evidence"
+    if any(term in value for term in ("answer does not match", "outside its evidence-linked", "structured claim list")):
+        return "output_contract"
+    if any(term in value for term in ("comparison claim", "comparison conclusion", "comparison is missing", "comparison omits")):
+        return "comparison_structure"
+    if any(term in value for term in ("chunk", "quote", "evidence reference", "citation")):
+        return "invalid_citation"
+    if any(term in value for term in ("entity", "subject", "attribute", "planner could not normalize")):
+        return "entity_attribute_mismatch"
+    if any(term in value for term in ("conflicts", "contradict", "polarity")):
+        return "contradictory_evidence"
+    if "abstention is not justified" in value:
+        return "unsupported_claim"
+    if any(term in value for term in ("unsupported", "not supported", "not express")):
+        return "unsupported_claim"
+    return "verification_failure"
 
 
 def _fact_evidence_available(fact: dict[str, Any], chunks: dict[str, str]) -> bool:
@@ -262,6 +290,17 @@ def verify_task_answer(task: dict[str, Any], candidate: dict[str, Any],
     if status != "supported":
         return EvidenceVerification("needs_retry", answer, [], "Unknown task status")
 
+    # Detect answer/claim drift before factual checks so callers get a contract
+    # diagnosis instead of an unrelated evidence failure.
+    if isinstance(claims, list):
+        claim_texts = [str(c.get("text", "")).strip() for c in claims if isinstance(c, dict)]
+        expected_answer = "\n".join(claim_texts)
+        if (len(claim_texts) != len(claims) or
+                re.sub(r"\s+", " ", answer).strip() != re.sub(r"\s+", " ", expected_answer).strip()):
+            return EvidenceVerification("needs_retry", answer, [],
+                                        "Task answer does not match its ordered claim texts",
+                                        failure_type="output_contract")
+
     quotes = [r["quote"] for r in valid_refs]
     present_facts = {r["fact_id"] for r in valid_refs}
     missing = [f["id"] for f in facts if f["id"] not in present_facts]
@@ -317,7 +356,17 @@ def verify_task_answer(task: dict[str, Any], candidate: dict[str, Any],
                 return EvidenceVerification("needs_retry", answer, valid_refs, f"Comparison omits condition: {condition}")
         by_fact = {fid: [r["quote"] for r in valid_refs if r["fact_id"] == fid]
                    for fid in required_ids}
-        if not _comparison_conclusion_matches(comparison, answer,
+        if comparison.get("attribute") == "nationality" and any(
+                len(_attribute_values("nationality", " ".join(by_fact.get(fid, [])))) > 1
+                for fid in required_ids):
+            return EvidenceVerification("needs_retry", answer, valid_refs,
+                                        "Conflicting nationality values in comparison evidence",
+                                        failure_type="contradictory_evidence")
+        comparison_claim_text = answer
+        if isinstance(claims, list):
+            comparison_claim_text = next((str(c.get("text", "")) for c in claims
+                                          if isinstance(c, dict) and c.get("entity") == "comparison"), "")
+        if not _comparison_conclusion_matches(comparison, comparison_claim_text,
                 by_fact.get(str(comparison["left_fact_id"]), []),
                 by_fact.get(str(comparison["right_fact_id"]), [])):
             return EvidenceVerification("needs_retry", answer, valid_refs,
@@ -327,6 +376,8 @@ def verify_task_answer(task: dict[str, Any], candidate: dict[str, Any],
     if isinstance(claims, list):
         claim_verification = _verify_claims(task, answer, claims, valid_refs, retrieved)
         if claim_verification:
+            if not claim_verification.failure_type:
+                claim_verification.failure_type = classify_verification_failure(claim_verification.reason)
             return claim_verification
     return EvidenceVerification("supported", answer, valid_refs)
 
@@ -386,7 +437,7 @@ def _attribute_supported(attribute: str, quote: str) -> bool:
     if attribute == "definition":
         return bool(re.search(r"\b(is|are|means|category|allows|refers|defined)\b", q))
     if attribute == "director":
-        return bool(re.search(r"\b(director|directed|directs)\b", q))
+        return bool(re.search(r"\b(director|directed|directs|direct|filmmaker)\b", q))
     if attribute == "premiere_date":
         return (bool(re.search(r"\b(premiere|premiered|release date|released)\b", q))
                 and bool(re.search(r"\b(?:\d{1,2}[/.-]\d{1,2}|\d{4}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b", q)))
@@ -407,7 +458,7 @@ def _attribute_supported(attribute: str, quote: str) -> bool:
     if attribute == "neighborhood":
         return bool(re.search(r"\b(neighborhood|neighbourhood|located in|located at|situated in)\b", q))
     if attribute == "location":
-        return bool(re.search(r"\b(?:located|situated)\s+(?:in|at)\s+[A-Z\w]", quote)
+        return bool(re.search(r"\b(?:located|situated|based|held|hosted|host|hosts|takes place|take place|will take place|occurred)\b[^.!?]{0,80}\b(?:in|at)\s+[\w]", quote, re.I)
                     or re.search(r"\blocation\s*:\s*\S", quote, re.I))
     if attribute == "time":
         return bool(re.search(r"\b(date|time|year|month|day|when)\b", q))
@@ -418,6 +469,37 @@ def _attribute_supported(attribute: str, quote: str) -> bool:
     if attribute == "duration_relation":
         return True
     return True
+
+
+def _attribute_values(attribute: str, text: str) -> set[str]:
+    """Extract a small set of explicit values for contradiction screening."""
+    if attribute == "nationality":
+        vocab = r"american|british|canadian|french|german|italian|japanese|turkish|australian|irish|spanish|indian|chinese"
+        return {v.casefold() for v in re.findall(r"\b(" + vocab + r")\b", text, re.I)}
+    if attribute == "genre":
+        vocab = r"drama|comedy|documentary|thriller|romance|action|horror|western|musical|animation"
+        return {v.casefold() for v in re.findall(r"\b(" + vocab + r")\b", text, re.I)}
+    if attribute == "location":
+        patterns = (
+            r"\b(?:located|situated|based|held|hosted|host|hosts|takes place|take place|will take place|occurred)\b[^.!?]{0,80}?\b(?:in|at)\s+([^,.;]+)",
+            r"\bin\s+([A-Z][\w’'-]+(?:\s+[A-Z][\w’'-]+)?)\s+(?:neighbou?rhood|district)\b",
+        )
+        values = set()
+        for pattern in patterns:
+            for value in re.findall(pattern, text, re.I):
+                value = re.sub(r"\s+(?:neighbou?rhood|district)$", "", value, flags=re.I).strip()
+                if value:
+                    values.add(value.casefold())
+        return values
+    return set()
+
+
+def _claim_value_conflicts(attribute: str, claim: str, quotes: list[str]) -> bool:
+    claim_values = _attribute_values(attribute, claim)
+    evidence_values = [_attribute_values(attribute, quote) for quote in quotes]
+    if attribute == "nationality" and any(len(values) > 1 for values in evidence_values):
+        return True
+    return bool(claim_values and any(values and claim_values.isdisjoint(values) for values in evidence_values))
 
 
 def _polarity_conflict(claim: str, quote: str) -> bool:
@@ -438,10 +520,10 @@ def _polarity_conflict(claim: str, quote: str) -> bool:
 def _comparison_value(attribute: str, quotes: list[str]) -> str | None:
     text = " ".join(quotes)
     if attribute == "nationality":
-        values = re.findall(
+        values = {value.casefold() for value in re.findall(
             r"\b(american|british|canadian|french|german|italian|japanese|turkish|australian|irish|spanish|indian|chinese)\b",
-            text, re.I)
-        return values[-1].casefold() if values else None
+            text, re.I)}
+        return next(iter(values)) if len(values) == 1 else None
     if attribute == "neighborhood":
         named = re.findall(r"\b(?:in|at)\s+([A-Z][\w’'-]+(?:\s+[A-Z][\w’'-]+)?)\s+(?:neighbou?rhood|district)\b", text)
         if named:
@@ -450,14 +532,14 @@ def _comparison_value(attribute: str, quotes: list[str]) -> str | None:
         return values[-1].casefold() if values else None
     if attribute == "location":
         matches = re.findall(
-            r"\b(?:located|situated)\s+(?:in|at)\s+([^,.;]+)|\bin\s+([A-Z][\w’'-]+(?:\s+[A-Z][\w’'-]+)?)\s+(?:neighbou?rhood|district)\b",
-            text, re.I)
-        values = []
-        for first, second in matches:
-            value = first or second
-            value = re.sub(r"\s+(?:neighbou?rhood|district)$", "", value, flags=re.I).strip()
-            if value:
-                values.append(value.casefold())
+            r"\b(?:located|situated|based|held|hosted|host|hosts|takes place|take place|will take place|occurred)\b"
+            r"[^.!?]{0,80}?\b(?:in|at)\s+([^,.;]+)", text, re.I)
+        if not matches:
+            matches = re.findall(
+                r"\bin\s+([A-Z][\w’'-]+(?:\s+[A-Z][\w’'-]+)?)\s+(?:neighbou?rhood|district)\b",
+                text)
+        values = [re.sub(r"\s+(?:neighbou?rhood|district)$", "", value, flags=re.I).strip().casefold()
+                  for value in matches if value.strip()]
         return values[-1] if values else None
     return None
 
@@ -580,6 +662,14 @@ def _verify_claims(task: dict[str, Any], answer: str, claims: list[Any],
         if not set(fact_ids).issubset(seen_refs):
             return EvidenceVerification("needs_retry", answer, valid_refs,
                                         "Claim lacks evidence for every associated fact")
+        if not comparison_claim:
+            for fid in fact_ids:
+                fact = facts[fid]
+                quotes = evidence_text_by_fact.get(fid, [])
+                if _claim_value_conflicts(str(fact.get("attribute", "")), text, quotes):
+                    return EvidenceVerification("needs_retry", answer, valid_refs,
+                                                "Claim value contradicts cited evidence",
+                                                failure_type="contradictory_evidence")
         seen_fact_ids.update(seen_refs)
 
         if comparison_claim:

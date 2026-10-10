@@ -228,7 +228,7 @@ def test_unique_punctuation_and_whitespace_difference_resolves_to_exact_source_s
     task = {"id": "task_1", "question": "How do I enter Ambient Mode?",
             "required_facts": [asdict(fact)], "comparison": None}
     source = "To enter Ambient Mode , press the button."
-    ref = {"fact_id": fact.id, "chunk_id": "wrong:0", "quote": "To enter Ambient Mode, press the button"}
+    ref = {"fact_id": fact.id, "chunk_id": "actual:0", "quote": "To enter Ambient Mode, press the button"}
     candidate = _candidate(task, [(fact.entity, fact.attribute, source, [fact.id], [ref])])
     bound = bind_evidence_references(task, candidate, {fact.id: {"actual:0": source}})
     assert not bound.reason
@@ -266,29 +266,30 @@ def test_ambiguous_quote_fails_closed():
     fact = plan("What is the return window?")[0].required_facts[0]
     task = {"id": "task_1", "question": "What is the return window?",
             "required_facts": [asdict(fact)], "comparison": None}
-    quote = "Returns are accepted within 30 days."
-    ref = {"fact_id": fact.id, "chunk_id": "bad-id", "quote": quote}
+    quote = "Returns accepted within 30 days"
+    ref = {"fact_id": fact.id, "chunk_id": "a:0", "quote": quote}
     candidate = _candidate(task, [(fact.entity, fact.attribute, quote, [fact.id], [ref])])
     binding = bind_evidence_references(task, candidate,
-        {fact.id: {"a:0": quote, "b:0": quote}})
+        {fact.id: {"a:0": "Returns, accepted within 30 days. Returns accepted, within 30 days.",
+                   "b:0": quote}})
     assert "ambiguous" in binding.reason.lower()
 
 
-def test_invalid_and_suffix_missing_ids_are_resolved_only_by_unique_source_match():
+def test_invalid_chunk_id_is_rejected_even_when_quote_exists_elsewhere():
     fact = plan("What is the return window?")[0].required_facts[0]
     task = {"id": "task_1", "question": "What is the return window?",
             "required_facts": [asdict(fact)], "comparison": None}
     source = "Returns are accepted within 30 days."
     candidate = _candidate(task, [(fact.entity, fact.attribute, source, [fact.id], [
-        {"fact_id": fact.id, "chunk_id": "returns_0", "quote": source}])])
+        {"fact_id": fact.id, "chunk_id": "returns_other:0", "quote": source}])])
     binding = bind_evidence_references(task, candidate, {fact.id: {"returns_0:0": source}})
-    assert not binding.reason
-    assert binding.candidate["evidence_refs"][0]["chunk_id"] == "returns_0:0"
+    assert binding.failure_type == "invalid_citation"
+    assert "chunk id" in binding.reason.lower()
 
     bad = _candidate(task, [(fact.entity, fact.attribute, source, [fact.id], [
         {"fact_id": fact.id, "chunk_id": "missing:0", "quote": "That text is absent."}])])
     binding = bind_evidence_references(task, bad, {fact.id: {"returns_0:0": source}})
-    assert "not found" in binding.reason.lower()
+    assert "chunk id" in binding.reason.lower()
 
 
 def test_evidence_cannot_be_reassigned_to_a_different_planned_fact():
@@ -302,7 +303,7 @@ def test_evidence_cannot_be_reassigned_to_a_different_planned_fact():
     candidate = _candidate(task, [(b["entity"], b["attribute"], quote_a, [b["id"]], [ref])])
     binding = bind_evidence_references(task, candidate, {
         a["id"]: {"return:0": quote_a}, b["id"]: {"refund:0": "Approved refunds are issued within 5 business days."}})
-    assert "not found" in binding.reason.lower()
+    assert "chunk id" in binding.reason.lower()
 
 
 def test_heldout_single_fact_pipeline_preserves_original_grounded_behavior():
@@ -361,5 +362,3 @@ def test_heldout_password_length_pipeline_answers_without_temporal_confusion():
     assert result.task_answers[0].status == "supported"
     assert "12 characters" in result.answer
     assert "days" not in result.answer.lower()
-
-

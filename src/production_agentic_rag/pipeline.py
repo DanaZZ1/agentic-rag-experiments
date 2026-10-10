@@ -26,6 +26,7 @@ class QueryResult:
     blocked: bool = False
     trace: dict[str, Any] = field(default_factory=dict)
     task_answers: list[TaskAnswer] = field(default_factory=list)
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def context_texts(self) -> list[str]:
@@ -95,4 +96,5 @@ class RAGPipeline:
             faith = grounding_score(answer, [c.chunk.text for c in contexts])
         return QueryResult(question, answer, agent_answer.citations, contexts,
                            faith, agent_answer.iterations, trace=tracer.summary(),
-                           task_answers=agent_answer.task_answers)
+                           task_answers=agent_answer.task_answers,
+                           diagnostics=agent_answer.diagnostics)

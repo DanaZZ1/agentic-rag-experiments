@@ -183,6 +183,14 @@ def _subject_for(part: str, attribute: str, previous: tuple[str, list[str]] | No
         return _known_entity(m.group(1)) or _surface_entity(m.group(1))
     if re.search(r"\b(?:its|their)\b", part, re.I) and previous:
         return previous
+    # A coordinated predicate can omit the shared subject ("what does the
+    # warranty cover and exclude?"). Carry the explicitly resolved subject
+    # forward only for a bare predicate continuation.
+    if previous and re.fullmatch(
+            r"\s*(?:(?:does|do|is|are)\s+)?(?:cover|covers|exclude|excludes|include|includes|"
+            r"require|requires|allow|allows|provide|provides|offer|offers|cost|costs|charge|charges)\s*\??\s*",
+            part, re.I):
+        return previous
     m = re.search(patterns[3], part, re.I)
     if m:
         return _known_entity(m.group(1)) or _surface_entity(m.group(1))
@@ -289,7 +297,7 @@ def plan(question: str) -> list[PlannedTask]:
                                "coverage", [value]) for i, value in enumerate(values, 1)]
                 return [PlannedTask("task_1", question, facts)]
 
-    parts = re.split(r"\s*,\s*and\s+|\s+and\s+(?=(?:which|what|where|when|how|who|whether|is|are|does|do|select|choose|import|save|upload|transfer|send)\b)",
+    parts = re.split(r"\s*,\s*and\s+|\s+and\s+(?=(?:which|what|where|when|how|who|whether|is|are|does|do|select|choose|import|save|upload|transfer|send|cover|covers|exclude|excludes|include|includes|require|requires|allow|allows|provide|provides|offer|offers|cost|costs|charge|charges)\b)",
                      q, flags=re.I)
     if len(parts) == 1:
         parts = re.split(r"\s+also\s+|\s*;\s*|\s+then\s+", q, flags=re.I)
