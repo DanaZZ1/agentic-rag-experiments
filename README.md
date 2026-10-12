@@ -36,4 +36,4 @@ The source project's deterministic suite is run with:
 PYTHONPATH=src python -m pytest -q
 ```
 
-Tests that require optional packages may be skipped when those packages are unavailable. Tests should not call hosted model providers.
+The curated repository omits the local sample corpus under `data/`; legacy tests that load that fixture need it supplied separately. The complete offline suite was run with a temporary read-only link to the frozen V3.5 worktree fixture, which was removed afterward. Tests should not call hosted model providers.
