@@ -1,183 +1,39 @@
-# 🤖 production-agentic-rag
+# Agentic RAG Experiments
 
-A **provider-agnostic, production-grade agentic RAG system** — ingestion, hybrid
-retrieval, a self-correcting multi-hop agent, guardrails, a real evaluation harness,
-and built-in observability. The default configuration uses a deterministic mock LLM
-and local FastEmbed embeddings (`BAAI/bge-small-en-v1.5`), with no paid API required.
-FastEmbed downloads the model on first use; after that inference is local. Select
-`RAG_EMBED_PROVIDER=hashing` for the deterministic embedding baseline. Swap provider
-settings to run on **OpenAI or Azure OpenAI**.
+This repository contains the versioned production Agentic RAG implementation history and a small set of sanitized experiment summaries. It is an engineering record, not a claim that the latest version is more accurate.
 
-[![CI](https://github.com/chandanCoding/production-agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/chandanCoding/production-agentic-rag/actions)
+## Versions
 
-<p align="center">
-  <img src="docs/architecture.svg" width="920" alt="production-agentic-rag architecture">
-</p>
+The original frozen source commits used in the experiments are recorded here for provenance:
 
-## Why this exists
-Most RAG demos stop at "embed → top-k → prompt." Production systems need **planning,
-multi-hop retrieval, grounding checks, guardrails, evaluation, and observability**.
-This project implements those concerns as clean, swappable components.
+- V1: `1c695dd329bdfeb55660201e116713b42b7ce207`
+- V3.2: `3898854308a64d6591616771a0a57c938f346bb1`
+- V3.3: `09b1dabf354581e61cad8fb6e03efb1969785309`
+- V3.4: `2e24646bdd9fd90c03f78108ddffb565fd8c370d`
+- Frozen V3.5: `8786a71b93c5fdfda703d00021c12f46407e3e22`
 
-## Architecture
+The Git history in this curated repository was rewritten to remove private datasets, answer keys, local session files, and raw evaluation artifacts. Therefore, local commit IDs differ from the original frozen IDs. The frozen production worktrees were not changed.
 
-```
-                         ┌──────────────────────────── RAGPipeline ────────────────────────────┐
-  corpus ──▶ ingest ──▶  │  input guardrails ─▶ AgenticRAG ─▶ output guardrails (PII, grounding) │ ──▶ answer + citations
- (loaders,  (chunking)   │                         │                                             │
-  md/txt)                │        ┌────────────────┴───────────────┐                            │
-                         │        │  plan → for each sub-q:         │  ◀── self-correct if       │
-                         │        │     hybrid retrieve (BM25+dense │      faithfulness < τ      │
-                         │        │     → RRF fuse → rerank)        │                            │
-                         │        │  → synthesize (LLM) → score     │                            │
-                         │        └─────────────────────────────────┘                            │
-                         │  cross-cutting: providers (mock|FastEmbed|hashing|OpenAI) · Tracer (spans, tokens, cost) │
-                         └──────────────────────────────────────────────────────────────────────┘
-                                                   │
-                                        evaluation harness
-                              (hit@k · MRR · recall@k · nDCG · faithfulness · answer-F1)
-```
+## Experiment summary
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
+A paired 20-question development evaluation was run for V1 and V3.5. The saved aggregate measurements reported 22 V1 model calls and 12,237 tokens, and 29 V3.5 model calls and 68,930 tokens. V1 produced 20 final responses. V3.5 produced 1 `answered`, 12 `not_in_corpus`, and 7 `execution_failed` outcomes.
 
-## Features
-- **Ingestion** — file/dir loaders; fixed-size (overlap) and markdown-section chunkers.
-- **Hybrid retrieval** — BM25 (from scratch) + dense vectors, **Reciprocal Rank Fusion**, stopword-aware reranking, embedding cache.
-- **Agentic loop** — query **planning/decomposition**, **multi-hop** retrieval, grounded synthesis with **citations**, and **faithfulness-gated self-correction**.
-- **Guardrails** — prompt-injection input blocking, output PII redaction, grounding score.
-- **Evaluation** — labelled-dataset harness: hit@k, MRR, recall@k, nDCG, faithfulness, answer token-F1.
-- **Observability** — hierarchical trace spans, token + USD cost accounting, latency.
-- **Interfaces** — `prag` CLI (`ask`, `eval`), FastAPI service (`/ask`, `/health`), Docker, CI matrix.
-- **Provider-agnostic** — `mock` LLM and `fastembed` (local), `hashing` (baseline), or `openai` embeddings via config/env.
-- **Pluggable engine** — the same plan→retrieve→generate→self-correct flow runs on the built-in agent **or a real LangGraph `StateGraph`** (`RAG_ENGINE=langgraph`).
+The run's exact-match scorer is not a valid semantic accuracy measure. The development annotations were not independently human-validated, and there is no blinded semantic review result. These aggregates do not establish answer accuracy or a real-world quality improvement. See [the sanitized summary](docs/evaluation-summaries/v1-v3.5-development-paired.md).
 
-## Quickstart (local model, no API keys)
+A narrow V3.5 reliability repair was later prepared from the paired traces. Its changes and synthetic regression test are preserved as uncommitted work on `v3.5-targeted-reliability-repair`; that repair has not been evaluated with a new real-model run.
+
+## Repository contents and data handling
+
+This curated copy retains the production source and meaningful version history. It intentionally excludes benchmark questions, answer keys, corpus snapshots, raw model traces, local model/index caches, and credentials. Use independently sourced, approved datasets in a separate evaluation workspace. Do not add private or licensed data to this repository without authorization.
+
+No GitHub repository has been created and this local repository has no configured remote.
+
+## Offline tests
+
+The source project's deterministic suite is run with:
 
 ```bash
-pip install -e ".[dev]"          # or just: PYTHONPATH=src ...
-python examples/quickstart.py
-
-# CLI
-prag ask "what is the return window and how long do refunds take?"
-prag eval --k 3                  # runs the evaluation harness over data/eval/qa.jsonl
+PYTHONPATH=src python -m pytest -q
 ```
 
-The first run downloads the FastEmbed model. To run with the deterministic hashing
-baseline instead, prefix a command with `RAG_EMBED_PROVIDER=hashing`.
-
-Example `ask` output (local model; no API keys):
-```json
-{
-  "answer": "Customers may return any unused item within 30 days ... Approved refunds are issued ... within 5 business days ...",
-  "citations": ["handbook:0", "handbook:3"],
-  "faithfulness": 1.0,
-  "iterations": 1,
-  "trace": {"spans": 6, "input_tokens": 69, "output_tokens": 43, "cost_usd": 0.0}
-}
-```
-
-## Run on a real model
-```bash
-export RAG_LLM_PROVIDER=azure RAG_EMBED_PROVIDER=openai
-export AZURE_OPENAI_ENDPOINT=... AZURE_OPENAI_API_KEY=...
-prag ask "..."
-```
-(see `.env.example` for all settings)
-
-## Engines (built-in vs LangGraph)
-The agentic flow runs on either engine — same nodes, same self-correction loop:
-
-```bash
-pip install ".[langgraph]"
-RAG_ENGINE=langgraph prag ask "what is the return window and how long do refunds take?"
-# or: prag ask "..." --engine langgraph
-```
-The LangGraph engine compiles a `StateGraph` (`plan → retrieve → generate` with a
-conditional edge back through `reformulate` when faithfulness < threshold). If
-LangGraph isn't installed, the pipeline falls back to the built-in agent automatically.
-
-## Serve it
-```bash
-pip install -e ".[api]"
-uvicorn api.main:app --reload     # POST /ask  ·  GET /health  ·  /docs
-# or:
-docker build -t production-agentic-rag . && docker run -p 8000:8000 production-agentic-rag
-```
-
-## Optional integrations
-Two sibling libraries plug in when installed (graceful fallback otherwise):
-
-```bash
-pip install ".[gateway]"        # secure every tool call via mcp-tool-gateway
-pip install ".[observability]"  # export token/cost/eval via llm-observability
-```
-```python
-from production_agentic_rag.integrations import SecuredRetrievalTool, export_observability
-pipeline.agent.tool = SecuredRetrievalTool(pipeline.retriever)   # JWT + injection inspection + audit
-# now retrieval calls are authorized, inspected, and audited — even in-process
-```
-See `examples/with_integrations.py`. Without these packages the core behaves identically.
-
-## Tests
-```bash
-PYTHONPATH=src pytest -q          # 20 tests, fully offline
-```
-
-## Results (sample evaluation)
-Running the bundled harness (`RAG_EMBED_PROVIDER=hashing prag eval --k 3`) over the
-sample corpus and 5-question labeled set, with the deterministic hashing embedder
-and mock LLM (no API keys):
-
-| Metric | Score |
-|--------|-------|
-| Retrieval hit@3 | 1.00 |
-| MRR | 1.00 |
-| Recall@3 | 1.00 |
-| nDCG@3 | 1.00 |
-| Faithfulness (mean) | 1.00 |
-| Answer token-F1 vs reference | 0.37 |
-
-> These numbers are on a small, clean sample with the extractive mock generator —
-> they validate the **pipeline and metrics**, not model quality. The lower answer-F1
-> reflects the mock returning whole grounded sentences vs. terse reference answers;
-> with a real LLM, expect higher answer-F1 and lower-but-realistic faithfulness.
-> Point `RAG_LLM_PROVIDER=azure` at your own corpus to get production-representative numbers.
-
-## Project layout
-```
-production-agentic-rag/
-├── src/production_agentic_rag/
-│   ├── providers/      # LLM + embedding abstractions (mock / openai / azure)
-│   ├── ingestion/      # loaders + chunking
-│   ├── retrieval/      # bm25, vector store, hybrid (RRF + rerank)
-│   ├── agents/         # planner, tools, agentic RAG loop
-│   ├── evaluation/     # metrics + harness
-│   ├── guardrails.py · observability.py · pipeline.py · config.py · cli.py
-├── api/main.py         # FastAPI service
-├── data/               # sample corpus + eval dataset
-├── tests/ · examples/ · docs/
-└── Dockerfile · Makefile · .github/workflows/ci.yml
-```
-
-## Limitations & roadmap
-Being explicit about the boundaries — this is a reference implementation, not a hosted product:
-
-- **Local in-memory index.** The vector store is in-process; for scale, swap `VectorStore`
-  for a persistent backend (pgvector / Azure AI Search / FAISS) behind the same interface.
-- **The hashing baseline is lexical-ish.** `HashingEmbedder` is deterministic for
-  tests/CI; the default FastEmbed model provides local semantic embeddings.
-- **Heuristic planner & reranker.** Query decomposition and reranking are rule-based by
-  default; the interfaces are LLM-ready (or cross-encoder-ready) drop-ins.
-- **Eval set is illustrative.** The bundled 5-question set proves the harness; real
-  evaluation needs a domain golden set and human-rated faithfulness.
-- **No streaming / multi-tenant auth yet.** The FastAPI service is single-tenant and
-  returns whole responses.
-
-**Roadmap:** persistent vector backend · cross-encoder reranker · streaming responses ·
-LLM-as-judge eval · per-tenant auth on the API · caching of full RAG responses.
-
-## Tech
-Python 3.10+ · FastEmbed/ONNX Runtime · optional: `openai`, `fastapi`, `langgraph`, `pytest` · Docker · GitHub Actions
-
-## License
-MIT — see [LICENSE](LICENSE).
+Tests that require optional packages may be skipped when those packages are unavailable. Tests should not call hosted model providers.

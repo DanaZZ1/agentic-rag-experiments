@@ -17,3 +17,27 @@ env/
 .vscode/
 dist/
 build/
+
+# Curated experiments repository: never commit private corpora or run artifacts.
+.env*
+!.env.example
+.venv/
+venv/
+env/
+__pycache__/
+.pytest_cache/
+.cache/
+**/cache/
+**/model_cache/
+**/models--*/
+**/vectorstore/
+**/chroma/
+**/faiss_index/
+**/*.faiss
+**/*.index
+**/*.sqlite3
+**/*.db
+**/*.pdf
+**/*answer_key*.jsonl
+**/*paired_trace*.json
+**/*raw_diagnostic*.json
