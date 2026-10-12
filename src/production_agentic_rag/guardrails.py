@@ -255,10 +255,12 @@ def _explicit_abstention(answer: str) -> bool:
 def classify_verification_failure(reason: str) -> str:
     """Classify deterministic check failures for diagnostics and retry policy."""
     value = reason.casefold()
-    if any(term in value for term in ("missing evidence", "does not contain the required attribute",
-                                      "no retrieved chunks", "number absent from evidence",
-                                      "missing evidence for required fact")):
+    if any(term in value for term in ("does not contain the required attribute", "no retrieved chunks",
+                                      "number absent from evidence")):
         return "insufficient_evidence"
+    if any(term in value for term in ("missing evidence for required fact",
+                                      "comparison is missing evidence for an operand")):
+        return "missing_evidence_reference"
     if any(term in value for term in ("answer does not match", "outside its evidence-linked", "structured claim list")):
         return "output_contract"
     if any(term in value for term in ("comparison claim", "comparison conclusion", "comparison is missing", "comparison omits")):

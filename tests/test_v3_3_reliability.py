@@ -7,7 +7,8 @@ from dataclasses import asdict, replace
 
 from production_agentic_rag import RAGPipeline, Settings
 from production_agentic_rag.agents.planner import plan
-from production_agentic_rag.guardrails import bind_evidence_references, verify_task_answer
+from production_agentic_rag.guardrails import (bind_evidence_references,
+    classify_verification_failure, verify_task_answer)
 from production_agentic_rag.providers.llm import LLMResult
 
 
@@ -310,6 +311,12 @@ def test_retry_exhaustion_with_available_evidence_is_execution_failure_not_abste
     assert result.task_answers[0].final_state == "execution_failed"
     assert "not present in the corpus" not in result.answer.lower()
     assert result.diagnostics[-1]["category"] == "retry_exhausted"
+
+
+def test_retry_classifier_separates_missing_candidate_references_from_retrieval_miss():
+    assert classify_verification_failure("Missing evidence for required fact") == "missing_evidence_reference"
+    assert classify_verification_failure("Evidence does not contain the required attribute") == "insufficient_evidence"
+    assert classify_verification_failure("Comparison is missing evidence for an operand") == "missing_evidence_reference"
 
 
 def test_held_out_synthetic_entity_attribute_and_paraphrase_are_verified():
