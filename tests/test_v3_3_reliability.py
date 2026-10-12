@@ -102,12 +102,15 @@ def test_binding_reports_missing_reference_wrong_chunk_and_wrong_fact():
     quote = "Returns are accepted within 30 days."
     by_fact = {fact["id"]: {"c:0": quote}}
     no_ref = _candidate(fact, quote, refs=False)
-    assert bind_evidence_references(task, no_ref, by_fact).failure_type == "missing_evidence_reference"
+    rebound = bind_evidence_references(task, no_ref, by_fact)
+    assert rebound.failure_type == ""
+    assert rebound.repairs[0]["kind"] == "missing_reference_recovered_from_claim_span"
     wrong_chunk = _candidate(fact, quote)
     wrong_chunk["claims"][0]["evidence_refs"][0]["chunk_id"] = "invented:0"
     wrong_chunk["evidence_refs"][0]["chunk_id"] = "invented:0"
     bound = bind_evidence_references(task, wrong_chunk, by_fact)
-    assert bound.failure_type == "invalid_citation"
+    assert bound.failure_type == ""
+    assert bound.repairs[0]["kind"] == "invalid_chunk_id_rebound_by_unique_source_span"
     wrong_span = _candidate(fact, quote)
     wrong_span["claims"][0]["evidence_refs"][0]["quote"] = "Text absent from this chunk."
     bound = bind_evidence_references(task, wrong_span, by_fact)
@@ -148,7 +151,9 @@ def test_comparison_requires_conclusion_and_references_and_checks_same_different
     assert result.failure_type == "output_contract"
     missing_refs = _comparison_candidate(same_plan, qa, qb, "the same nationality", comparison_refs=False)
     binding = bind_evidence_references(task, missing_refs, by_fact)
-    assert binding.failure_type == "missing_evidence_reference"
+    assert binding.failure_type == ""
+    assert any(r["kind"] == "claim_reference_reused_from_task_reference" for r in binding.repairs)
+    assert len(binding.candidate["claims"][2]["evidence_refs"]) == 2
     good = _comparison_candidate(same_plan, qa, qb, "the same nationality")
     binding = bind_evidence_references(task, good, by_fact)
     result = verify_task_answer(task, binding.candidate, {"a:0": qa, "b:0": qb}, require_claims=True,
@@ -242,26 +247,25 @@ def _repair_pipeline(failure, *, weak_first=False):
     return pipe, llm, tool
 
 
-def test_retry_repairs_answer_contract_without_retrieval():
+def test_answer_contract_is_repaired_without_regeneration_or_retrieval():
     pipe, llm, tool = _repair_pipeline("contract")
     result = pipe.query("What is the return window?")
     assert result.task_answers[0].status == "supported"
-    assert llm.calls == 2 and tool.calls == 1
-    assert result.diagnostics[0]["failure_type"] == "output_contract"
+    assert result.final_state == "answered"
+    assert result.task_answers[0].original_answer.endswith("Extra unsupported sentence.")
+    assert "Extra unsupported sentence" not in result.answer
+    assert llm.calls == 1 and tool.calls == 1
+    assert result.diagnostics[0]["serialization_repaired"] is True
     assert result.diagnostics[0]["verifier_invoked"] is True
-    assert llm.retry_guidance[1]["retrieval_performed"] is False
-    assert llm.retry_guidance[1]["action"] == "regenerate_from_existing_evidence"
 
 
-def test_retry_repairs_missing_reference_without_retrieval_or_counting_verifier_call():
+def test_missing_reference_repairs_from_unique_claim_span_without_regeneration():
     pipe, llm, tool = _repair_pipeline("missing_ref")
     result = pipe.query("What is the return window?")
     assert result.task_answers[0].status == "supported"
-    assert llm.calls == 2 and tool.calls == 1
-    assert result.diagnostics[0]["phase"] == "binding"
-    assert result.diagnostics[0]["failure_type"] == "missing_evidence_reference"
-    assert result.diagnostics[0]["verifier_invoked"] is False
-    assert llm.retry_guidance[1]["retrieval_performed"] is False
+    assert llm.calls == 1 and tool.calls == 1
+    assert result.diagnostics[0]["binding_repairs"][0]["kind"] == "missing_reference_recovered_from_claim_span"
+    assert result.diagnostics[0]["verifier_invoked"] is True
 
 
 def test_insufficient_evidence_triggers_a_query_retry_and_retrieval():
@@ -273,6 +277,58 @@ def test_insufficient_evidence_triggers_a_query_retry_and_retrieval():
     assert result.diagnostics[0]["failure_type"] == "insufficient_evidence"
     assert result.diagnostics[1]["retrieval_performed"] is True
     assert llm.retry_guidance[1]["action"] == "reformulate_retrieval_query"
+
+
+class _NeverValidLLM:
+    def __init__(self):
+        self.calls = 0
+
+    def complete(self, system, user):
+        payload = json.loads(user.split("\n", 1)[1])
+        task = payload["tasks"][0]
+        fact = task["required_facts"][0]
+        chunks = task["evidence"][0]["chunks"]
+        quote = next(text.strip() for chunk in chunks for text in re.split(r"(?<=[.!?])\s+", chunk["text"])
+                     if "30 days" in text)
+        ref = {"fact_id": fact["id"], "chunk_id": next(c["chunk_id"] for c in chunks if quote in c["text"]),
+               "quote": quote}
+        claim = {"claim_id": "bad", "entity": "unrelated_entity", "attribute": fact["attribute"],
+                 "text": quote, "fact_ids": [fact["id"]], "evidence_refs": [ref]}
+        self.calls += 1
+        return LLMResult(json.dumps({"tasks": [{"task_id": task["id"], "status": "supported",
+            "answer": quote, "claims": [claim], "evidence_refs": [ref]}]}))
+
+
+def test_retry_exhaustion_with_available_evidence_is_execution_failure_not_abstention():
+    pipe, _, tool = _repair_pipeline("contract")
+    llm = _NeverValidLLM()
+    pipe.agent.llm = llm
+    pipe.agent.tool = tool
+    result = pipe.query("What is the return window?")
+    assert llm.calls == 2 and tool.calls == 1
+    assert result.final_state == "execution_failed"
+    assert result.task_answers[0].final_state == "execution_failed"
+    assert "not present in the corpus" not in result.answer.lower()
+    assert result.diagnostics[-1]["category"] == "retry_exhausted"
+
+
+def test_held_out_synthetic_entity_attribute_and_paraphrase_are_verified():
+    question = "Where will the Lumen Forum be staged?"
+    quote = "Organizers will host the Lumen Forum at Cedar Pavilion."
+    _, task = _fact_task(question)
+    fact = task["required_facts"][0]
+    fact.update(entity="lumen_forum", entity_aliases=["Lumen Forum"], attribute="location", verifiable=True)
+    task["required_facts"] = [fact]
+    ref = {"fact_id": fact["id"], "chunk_id": "heldout:0", "quote": quote}
+    claim = {"claim_id": "h", "entity": "lumen_forum", "attribute": "location", "text": quote,
+             "fact_ids": [fact["id"]], "evidence_refs": [ref]}
+    candidate = {"status": "supported", "answer": quote, "claims": [claim],
+                 "evidence_refs": [ref]}
+    bound = bind_evidence_references(task, candidate, {fact["id"]: {"heldout:0": quote}})
+    result = verify_task_answer(task, bound.candidate, {"heldout:0": quote}, require_claims=True,
+                                retrieved_by_fact={fact["id"]: {"heldout:0": quote}})
+    assert result.status == "supported"
+    assert result.answer == quote
 
 
 def test_planner_splits_independent_coordinated_predicates_without_domain_question():

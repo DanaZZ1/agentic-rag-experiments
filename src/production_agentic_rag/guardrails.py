@@ -69,6 +69,7 @@ class EvidenceBinding:
     candidate: dict[str, Any]
     reason: str = ""
     failure_type: str = ""
+    repairs: list[dict[str, str]] | None = None
 
 
 def _normalize_evidence_text(text: str) -> list[re.Match[str]]:
@@ -109,15 +110,61 @@ def bind_evidence_references(task: dict[str, Any], candidate: dict[str, Any],
     facts = {str(f.get("id")): f for f in task.get("required_facts", [])}
     bound_claims: list[dict[str, Any]] = []
     all_refs: list[dict[str, str]] = []
+    repairs: list[dict[str, str]] = []
     for claim in claims:
         if not isinstance(claim, dict):
             return EvidenceBinding(normalized, "Malformed claim", "output_contract")
         fact_ids = [str(fid) for fid in claim.get("fact_ids", [])]
         refs = claim.get("evidence_refs")
-        if not fact_ids or not isinstance(refs, list) or not refs:
-            return EvidenceBinding(normalized, "Claim is missing fact association or evidence hints", "missing_evidence_reference")
+        if not fact_ids:
+            return EvidenceBinding(normalized, "Claim is missing fact association", "incorrect_fact_association", repairs)
         if any(fid not in facts for fid in fact_ids):
-            return EvidenceBinding(normalized, "Claim references an unplanned fact", "incorrect_fact_association")
+            return EvidenceBinding(normalized, "Claim references an unplanned fact", "incorrect_fact_association", repairs)
+        if not isinstance(refs, list):
+            refs = []
+        if not refs:
+            task_refs = candidate.get("evidence_refs", [])
+            if isinstance(task_refs, list):
+                refs = [dict(ref) for ref in task_refs if isinstance(ref, dict)
+                        and str(ref.get("fact_id", "")) in fact_ids]
+                for ref in refs:
+                    repairs.append({"kind": "claim_reference_reused_from_task_reference",
+                                    "fact_id": str(ref.get("fact_id", "")),
+                                    "chunk_id": str(ref.get("chunk_id", ""))})
+        if set(str(ref.get("fact_id", "")) for ref in refs if isinstance(ref, dict)) != set(fact_ids):
+            text = str(claim.get("text", "")).strip()
+            present_facts = {str(ref.get("fact_id", "")) for ref in refs if isinstance(ref, dict)}
+            for fid in fact_ids:
+                if fid in present_facts:
+                    continue
+                matches = [(cid, span) for cid, source in retrieved_by_fact.get(fid, {}).items()
+                           for span in _source_spans(text, source)]
+                matches = list(dict.fromkeys(matches))
+                if len(matches) == 1:
+                    cid, quote = matches[0]
+                    refs.append({"fact_id": fid, "chunk_id": cid, "quote": quote})
+                    repairs.append({"kind": "missing_reference_recovered_from_claim_span",
+                                    "fact_id": fid, "chunk_id": cid})
+            present_facts = {str(ref.get("fact_id", "")) for ref in refs if isinstance(ref, dict)}
+            if not set(fact_ids).issubset(present_facts):
+                return EvidenceBinding(normalized,
+                    "Claim is missing evidence references for one or more associated facts",
+                    "missing_evidence_reference", repairs)
+        if not refs:
+            text = str(claim.get("text", "")).strip()
+            for fid in fact_ids:
+                matches = [(cid, span) for cid, source in retrieved_by_fact.get(fid, {}).items()
+                           for span in _source_spans(text, source)]
+                matches = list(dict.fromkeys(matches))
+                if len(matches) == 1:
+                    cid, quote = matches[0]
+                    refs.append({"fact_id": fid, "chunk_id": cid, "quote": quote})
+                    repairs.append({"kind": "missing_reference_recovered_from_claim_span",
+                                    "fact_id": fid, "chunk_id": cid})
+            if not refs:
+                return EvidenceBinding(normalized,
+                    "Claim is missing evidence references and has no unique exact source span",
+                    "missing_evidence_reference", repairs)
         bound_refs: list[dict[str, str]] = []
         for ref in refs:
             if not isinstance(ref, dict):
@@ -133,7 +180,18 @@ def bind_evidence_references(task: dict[str, Any], candidate: dict[str, Any],
             if not quote:
                 return EvidenceBinding(normalized, "Evidence hint contains no source text", "invalid_citation")
             if not hint_id or hint_id not in chunks:
-                return EvidenceBinding(normalized, f"Evidence chunk ID {hint_id!r} was not retrieved", "invalid_citation")
+                # Rebind only a unique exact source span within this fact's
+                # retrieved evidence. Never search other facts or the corpus.
+                matches = [(cid, span) for cid, source in chunks.items()
+                           for span in ([quote] if quote in source else _source_spans(quote, source))]
+                matches = list(dict.fromkeys(matches))
+                if len(matches) != 1:
+                    return EvidenceBinding(normalized,
+                        f"Evidence chunk ID {hint_id!r} was not retrieved and source span was not unique",
+                        "invalid_citation", repairs)
+                hint_id, quote = matches[0]
+                repairs.append({"kind": "invalid_chunk_id_rebound_by_unique_source_span",
+                                "fact_id": fid, "chunk_id": hint_id})
             if quote not in chunks[hint_id] and not _source_spans(quote, chunks[hint_id]):
                 if len(_sentence_candidates(quote)) > 1:
                     return EvidenceBinding(normalized,
@@ -171,7 +229,7 @@ def bind_evidence_references(task: dict[str, Any], candidate: dict[str, Any],
         all_refs.extend(claim_copy["evidence_refs"])
     normalized["claims"] = bound_claims
     normalized["evidence_refs"] = list({(r["fact_id"], r["chunk_id"], r["quote"]): r for r in all_refs}.values())
-    return EvidenceBinding(normalized)
+    return EvidenceBinding(normalized, repairs=repairs)
 
 
 def typed_value_request(question: str) -> str | None:
@@ -197,8 +255,9 @@ def _explicit_abstention(answer: str) -> bool:
 def classify_verification_failure(reason: str) -> str:
     """Classify deterministic check failures for diagnostics and retry policy."""
     value = reason.casefold()
-    if any(term in value for term in ("missing evidence", "required fact", "does not contain the required",
-                                      "no retrieved chunks", "number absent from evidence")):
+    if any(term in value for term in ("missing evidence", "does not contain the required attribute",
+                                      "no retrieved chunks", "number absent from evidence",
+                                      "missing evidence for required fact")):
         return "insufficient_evidence"
     if any(term in value for term in ("answer does not match", "outside its evidence-linked", "structured claim list")):
         return "output_contract"

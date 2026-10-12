@@ -28,4 +28,6 @@ def test_single_hop_grounded():
     # This fixture states that electronics have a limited warranty, but says
     # nothing about what it covers. The evidence-aware agent must abstain.
     assert not a.citations
-    assert "not present in the corpus" in a.answer.lower()
+    assert a.task_answers[0].status == "not_in_corpus"
+    assert a.task_answers[0].final_state == "not_in_corpus"
+    assert "couldn't complete verification" not in a.answer.lower()

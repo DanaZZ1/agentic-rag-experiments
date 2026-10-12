@@ -145,6 +145,10 @@ class TaskAnswer:
     missing_fact_ids: list[str] = field(default_factory=list)
     claims: list[Claim] = field(default_factory=list)
     failure_type: str = ""
+    # Public outcome is distinct from the verifier's internal status.
+    final_state: str = ""
+    original_answer: str = ""
+    error_reason: str = ""
 
 
 @dataclass
@@ -164,6 +168,7 @@ class AgentAnswer:
     citations: list[str] = field(default_factory=list)
     task_answers: list[TaskAnswer] = field(default_factory=list)
     diagnostics: list[dict] = field(default_factory=list)
+    final_state: str = ""
 
 
 def _task_dict(task: PlannedTask) -> dict:
@@ -246,8 +251,23 @@ class AgenticRAG:
                         payload_tasks.append(td)
 
                 with tracer.span("generate", round=round_no):
-                    result = self.llm.complete(_SYSTEM, _build_prompt(question, payload_tasks))
-                    tracer.record_usage(self.model, result.usage)
+                    try:
+                        result = self.llm.complete(_SYSTEM, _build_prompt(question, payload_tasks))
+                        tracer.record_usage(self.model, result.usage)
+                    except Exception as exc:
+                        reason = f"Model generation failed: {type(exc).__name__}: {exc}"
+                        for tid in list(pending):
+                            verified[tid] = TaskAnswer(
+                                tid, "execution_failed", "I couldn't complete verification for this request.",
+                                reason=reason, retries=attempts[tid], failure_type="internal_execution_failure",
+                                final_state="execution_failed", error_reason=reason)
+                            diagnostics.append({"round": round_no, "task_id": tid, "phase": "generation",
+                                "status": "failed", "category": "internal_execution_failure",
+                                "failure_type": "internal_execution_failure", "reason": reason,
+                                "retry_action": "none", "retrieval_performed": tid in retrieval_performed_tasks,
+                                "verifier_invoked": False})
+                            pending.remove(tid)
+                        break
                 expected_task_ids = set(pending)
                 try:
                     generated_by_id = _parse_generated_tasks(result.text, expected_task_ids)
@@ -273,29 +293,62 @@ class AgenticRAG:
                         for fid, fact_chunks in retrieved[tid].items()
                     }
                     candidate = raw
+                    generated_answer = str(raw.get("answer", ""))
                     binding_error = ""
+                    binding_repairs = []
                     if raw.get("status") == "supported":
                         binding = bind_evidence_references(_task_dict(task), raw, retrieved_by_fact)
                         candidate, binding_error = binding.candidate, binding.reason
+                        binding_repairs = binding.repairs or []
                     if binding_error:
                         verification = EvidenceVerification("needs_retry", str(raw.get("answer", "")),
                                                             [], binding_error,
                                                             failure_type=binding.failure_type or "invalid_citation")
                         phase = "binding"
                     else:
-                        verification = verify_task_answer(_task_dict(task), candidate, per_task_chunks,
-                                                          require_claims=True,
-                                                          retrieved_by_fact=retrieved_by_fact)
+                        # Structured claims are the only candidate source for answer text.
+                        # This repairs serialization drift without another generation call;
+                        # all claims are still independently checked by the verifier below.
+                        candidate = dict(candidate)
+                        claims = candidate.get("claims")
+                        if candidate.get("status") == "supported" and isinstance(claims, list) and all(
+                                isinstance(c, dict) and isinstance(c.get("text"), str) for c in claims):
+                            ordered_claims = _ordered_claims(task, claims)
+                            assembled = "\n".join(str(c["text"]).strip() for c in ordered_claims)
+                            candidate["claims"] = ordered_claims
+                            candidate["answer"] = assembled
+                        try:
+                            verification = verify_task_answer(_task_dict(task), candidate, per_task_chunks,
+                                                              require_claims=True,
+                                                              retrieved_by_fact=retrieved_by_fact)
+                        except Exception as exc:
+                            verification = EvidenceVerification("needs_retry", generated_answer, [],
+                                f"Verifier execution failed: {type(exc).__name__}: {exc}",
+                                failure_type="internal_execution_failure")
                         phase = "verifier"
                         if verification.status == "needs_retry" and not verification.failure_type:
                             verification.failure_type = classify_verification_failure(verification.reason)
+                    category = _failure_category(phase, verification.status, verification.failure_type)
                     diagnostics.append({"round": round_no, "task_id": tid, "phase": phase,
                                         "status": verification.status,
+                                        "category": category,
                                         "failure_type": verification.failure_type,
                                         "reason": verification.reason,
+                                        "generated_answer": generated_answer,
+                                        "assembled_answer": str(candidate.get("answer", "")),
+                                        "serialization_repaired": generated_answer != str(candidate.get("answer", "")),
+                                        "binding_repairs": binding_repairs,
                                         "retry_action": _retry_action(verification.failure_type),
                                         "retrieval_performed": tid in retrieval_performed_tasks,
                                         "verifier_invoked": phase == "verifier"})
+                    if verification.failure_type == "internal_execution_failure":
+                        verified[tid] = TaskAnswer(tid, "execution_failed",
+                            "I couldn't complete verification for this request.", [], verification.reason,
+                            attempts[tid], failure_type="internal_execution_failure",
+                            final_state="execution_failed", original_answer=generated_answer,
+                            error_reason=verification.reason)
+                        pending.remove(tid)
+                        continue
                     if verification.status in ("supported", "not_in_corpus"):
                         valid_claims = []
                         if verification.status == "supported":
@@ -308,9 +361,11 @@ class AgenticRAG:
                                     fact_ids=[str(fid) for fid in claim.get("fact_ids", [])],
                                     evidence_refs=[EvidenceRef(**ref) for ref in claim.get("evidence_refs", [])],
                                 ))
+                        outcome = "answered" if verification.status == "supported" else "not_in_corpus"
                         verified[tid] = TaskAnswer(tid, verification.status, verification.answer,
                             [EvidenceRef(**ref) for ref in verification.evidence_refs], verification.reason,
-                            attempts[tid], claims=valid_claims)
+                            attempts[tid], claims=valid_claims, final_state=outcome,
+                            original_answer=generated_answer)
                         pending.remove(tid)
                     else:
                         attempts[tid] += 1
@@ -322,17 +377,57 @@ class AgenticRAG:
         # Never expose an unverified candidate when the bounded retry budget is exhausted.
         for tid in pending:
             task = task_by_id[tid]
-            verified[tid] = TaskAnswer(tid, "not_in_corpus",
-                f"The requested information is not present in the corpus: {task.question}", [],
-                verified[tid].reason if tid in verified else "Verification did not pass", attempts[tid],
-                failure_type=verified[tid].failure_type if tid in verified else "verification_failure")
+            previous = verified.get(tid)
+            reason = previous.reason if previous else "Verification did not pass"
+            failure_type = previous.failure_type if previous else "retry_exhausted"
+            evidence_absent = failure_type == "insufficient_evidence"
+            state = "not_in_corpus" if evidence_absent else "execution_failed"
+            answer = (f"The available evidence does not answer: {task.question}"
+                      if evidence_absent else "I couldn't verify an answer from the available evidence.")
+            verified[tid] = TaskAnswer(tid, state, answer, [], reason, attempts[tid],
+                failure_type=failure_type, final_state=state, error_reason="" if evidence_absent else reason,
+                original_answer=previous.answer if previous else "")
+            diagnostics.append({"task_id": tid, "phase": "recovery", "status": state,
+                "category": "insufficient_evidence" if evidence_absent else "retry_exhausted",
+                "failure_type": "insufficient_evidence" if evidence_absent else "retry_exhausted", "reason": reason,
+                "underlying_failure_type": failure_type, "retry_action": "none",
+                "retrieval_performed": False, "verifier_invoked": False})
         ordered = [verified[t.id] for t in tasks]
         answer_parts = [ta.answer for ta in ordered]
         final_answer = "\n".join(answer_parts)
         citations = list(dict.fromkeys(ref.chunk_id for ta in ordered if ta.status == "supported" for ref in ta.evidence_refs))
         all_contexts = [r.chunk.text for h in hops for r in h.contexts]
         faith = grounding_score(final_answer, all_contexts)
-        return AgentAnswer(question, final_answer, hops, faith, iterations, citations, ordered, diagnostics)
+        final_state = ("execution_failed" if any(t.final_state == "execution_failed" for t in ordered)
+                       else "answered" if any(t.final_state == "answered" for t in ordered)
+                       else "not_in_corpus")
+        return AgentAnswer(question, final_answer, hops, faith, iterations, citations, ordered, diagnostics,
+                           final_state)
+
+
+def _ordered_claims(task: PlannedTask, claims: list[dict]) -> list[dict]:
+    """Stable task-fact ordering; a comparison conclusion follows its operands."""
+    fact_order = {fact.id: index for index, fact in enumerate(task.required_facts)}
+    indexed = list(enumerate(claims))
+    return [claim for _, claim in sorted(indexed, key=lambda pair: (
+        pair[1].get("entity") == "comparison",
+        min((fact_order.get(str(fid), len(fact_order)) for fid in pair[1].get("fact_ids", [])),
+            default=len(fact_order)), pair[0]))]
+
+
+def _failure_category(phase: str, status: str, failure_type: str) -> str:
+    if status in ("supported", "not_in_corpus"):
+        return "verified_conclusion"
+    if failure_type in ("output_contract", "output_contract_failure"):
+        return "output_contract_failure"
+    if phase == "binding" or failure_type in ("missing_evidence_reference", "invalid_citation",
+            "ambiguous_citation", "incorrect_fact_association"):
+        return "evidence_binding_failure"
+    if failure_type == "insufficient_evidence":
+        return "insufficient_evidence"
+    if failure_type == "internal_execution_failure":
+        return "internal_execution_failure"
+    return "claim_verification_failure"
 
 
 def _retry_action(failure_type: str) -> str:

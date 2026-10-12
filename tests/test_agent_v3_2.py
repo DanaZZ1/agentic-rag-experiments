@@ -275,7 +275,7 @@ def test_ambiguous_quote_fails_closed():
     assert "ambiguous" in binding.reason.lower()
 
 
-def test_invalid_chunk_id_is_rejected_even_when_quote_exists_elsewhere():
+def test_invalid_chunk_id_rebinds_only_when_source_span_is_unique_for_fact():
     fact = plan("What is the return window?")[0].required_facts[0]
     task = {"id": "task_1", "question": "What is the return window?",
             "required_facts": [asdict(fact)], "comparison": None}
@@ -283,8 +283,9 @@ def test_invalid_chunk_id_is_rejected_even_when_quote_exists_elsewhere():
     candidate = _candidate(task, [(fact.entity, fact.attribute, source, [fact.id], [
         {"fact_id": fact.id, "chunk_id": "returns_other:0", "quote": source}])])
     binding = bind_evidence_references(task, candidate, {fact.id: {"returns_0:0": source}})
-    assert binding.failure_type == "invalid_citation"
-    assert "chunk id" in binding.reason.lower()
+    assert binding.failure_type == ""
+    assert binding.repairs == [{"kind": "invalid_chunk_id_rebound_by_unique_source_span",
+                                "fact_id": fact.id, "chunk_id": "returns_0:0"}]
 
     bad = _candidate(task, [(fact.entity, fact.attribute, source, [fact.id], [
         {"fact_id": fact.id, "chunk_id": "missing:0", "quote": "That text is absent."}])])

@@ -27,6 +27,7 @@ class QueryResult:
     trace: dict[str, Any] = field(default_factory=dict)
     task_answers: list[TaskAnswer] = field(default_factory=list)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    final_state: str = ""
 
     @property
     def context_texts(self) -> list[str]:
@@ -97,4 +98,5 @@ class RAGPipeline:
         return QueryResult(question, answer, agent_answer.citations, contexts,
                            faith, agent_answer.iterations, trace=tracer.summary(),
                            task_answers=agent_answer.task_answers,
-                           diagnostics=agent_answer.diagnostics)
+                           diagnostics=agent_answer.diagnostics,
+                           final_state=agent_answer.final_state)
