@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 
-from ..guardrails import (EvidenceVerification, bind_evidence_references,
+from ..guardrails import (EvidenceVerification, bind_evidence_references, resolve_entity_alias,
                           classify_verification_failure, grounding_score,
                           typed_value_request, verify_task_answer)
 from ..observability import Tracer
@@ -68,6 +68,9 @@ conclusion when either operand or its comparison value is absent. For not_in_cor
 clear plain-language refusal (including "There is no evidence to determine...") and empty
 claims and evidence_refs arrays. Do not add prose outside the JSON object, use Markdown fences,
 or copy example values. If a task contains retry_guidance, address that specific failure.
+Treat task dependencies as ordered evidence requirements. Do not claim a downstream fact
+until the prerequisite fact identifies its entity; unresolved planning uncertainty is not
+permission to guess.
 Reuse supplied evidence for contract, citation, entity/attribute, and comparison repairs;
 do not claim evidence is absent when it is present. Request/retrieve more evidence only when
 the guidance says evidence is insufficient.'''
@@ -196,6 +199,7 @@ class AgenticRAG:
         attempts: dict[str, int] = {t.id: 0 for t in tasks}
         verified: dict[str, TaskAnswer] = {}
         diagnostics: list[dict] = []
+        retrieval_diagnostics: list[dict] = []
         pending = {t.id for t in tasks}
         task_by_id = {t.id: t for t in tasks}
         iterations = 0
@@ -229,8 +233,15 @@ class AgenticRAG:
                                                 candidate_k=max(self.tool.candidate_k, self.tool.retriever.size) if full else None)
                             hops.append(Hop(retry_query, results, tid))
                             bucket = retrieved[tid][fact.id]
+                            prior_chunk_ids = set(bucket)
                             for result in results:
                                 bucket.setdefault(result.chunk.id, result)
+                            retrieval_diagnostics.append({"round": round_no, "phase": "retrieval",
+                                "task_id": tid, "fact_id": fact.id, "query": retry_query,
+                                "returned_chunk_ids": [result.chunk.id for result in results],
+                                "new_chunk_ids": [result.chunk.id for result in results
+                                                  if result.chunk.id not in prior_chunk_ids],
+                                "recovery_action": "targeted_retrieval" if failed else "initial_retrieval"})
                         evidence_groups = []
                         for fact in task.required_facts:
                             chunk_list = list(retrieved[tid][fact.id].values())
@@ -247,6 +258,11 @@ class AgenticRAG:
                                 "reason": failed.reason,
                                 "action": _retry_action(failed.failure_type),
                                 "retrieval_performed": retrieve_again,
+                                "missing_fact_ids": list(failed.missing_fact_ids),
+                                "required_facts": [{"fact_id": f.id, "entity": f.entity,
+                                    "attribute": f.attribute, "description": f.description}
+                                    for f in task.required_facts],
+                                "reuse_retrieved_evidence": not retrieve_again,
                             }
                         payload_tasks.append(td)
 
@@ -329,6 +345,19 @@ class AgenticRAG:
                         if verification.status == "needs_retry" and not verification.failure_type:
                             verification.failure_type = classify_verification_failure(verification.reason)
                     category = _failure_category(phase, verification.status, verification.failure_type)
+                    entity_resolutions = []
+                    for claim in raw.get("claims", []) if isinstance(raw.get("claims"), list) else []:
+                        if not isinstance(claim, dict):
+                            continue
+                        for fid in claim.get("fact_ids", []):
+                            fact = next((f for f in task.required_facts if f.id == str(fid)), None)
+                            if fact:
+                                evidence_quotes = [str(ref.get("quote", "")) for ref in claim.get("evidence_refs", [])
+                                                  if isinstance(ref, dict)]
+                                entity_resolutions.append({"fact_id": fact.id,
+                                    "observed_entity": str(claim.get("entity", "")),
+                                    **resolve_entity_alias(fact.entity, str(claim.get("entity", "")),
+                                                           fact.entity_aliases, evidence_quotes)})
                     diagnostics.append({"round": round_no, "task_id": tid, "phase": phase,
                                         "status": verification.status,
                                         "category": category,
@@ -338,6 +367,7 @@ class AgenticRAG:
                                         "assembled_answer": str(candidate.get("answer", "")),
                                         "serialization_repaired": generated_answer != str(candidate.get("answer", "")),
                                         "binding_repairs": binding_repairs,
+                                        "entity_alias_resolutions": entity_resolutions,
                                         "retry_action": _retry_action(verification.failure_type),
                                         "retrieval_performed": tid in retrieval_performed_tasks,
                                         "verifier_invoked": phase == "verifier"})
@@ -369,6 +399,30 @@ class AgenticRAG:
                         pending.remove(tid)
                     else:
                         attempts[tid] += 1
+                        repeated = any(d.get("task_id") == tid and d.get("failure_type") == verification.failure_type
+                                       and d.get("reason") == verification.reason
+                                       and d.get("status") in ("needs_retry", "failed")
+                                       for d in diagnostics[:-1])
+                        if repeated:
+                            repeated_state = "not_in_corpus" if verification.failure_type == "insufficient_evidence" else "execution_failed"
+                            repeated_answer = (f"The available evidence does not answer: {task.question}"
+                                               if repeated_state == "not_in_corpus"
+                                               else "I couldn't verify an answer from the available evidence.")
+                            verified[tid] = TaskAnswer(tid, repeated_state,
+                                repeated_answer,
+                                [EvidenceRef(**ref) for ref in verification.evidence_refs],
+                                verification.reason, attempts[tid], verification.missing_fact_ids or [],
+                                failure_type=verification.failure_type, final_state=repeated_state,
+                                error_reason="" if repeated_state == "not_in_corpus" else verification.reason,
+                                original_answer=generated_answer)
+                            diagnostics.append({"round": round_no, "task_id": tid, "phase": "recovery",
+                                "status": repeated_state, "category": "retry_exhausted",
+                                "failure_type": "retry_exhausted", "underlying_failure_type": verification.failure_type,
+                                "reason": verification.reason, "retry_action": "stop_repeated_failure",
+                                "retrieval_performed": tid in retrieval_performed_tasks,
+                                "verifier_invoked": True})
+                            pending.remove(tid)
+                            continue
                         verified[tid] = TaskAnswer(tid, "needs_retry", raw.get("answer", ""),
                             [EvidenceRef(**ref) for ref in verification.evidence_refs],
                             verification.reason, attempts[tid], verification.missing_fact_ids or [],
@@ -392,6 +446,12 @@ class AgenticRAG:
                 "failure_type": "insufficient_evidence" if evidence_absent else "retry_exhausted", "reason": reason,
                 "underlying_failure_type": failure_type, "retry_action": "none",
                 "retrieval_performed": False, "verifier_invoked": False})
+        support_diagnostics = retrieval_diagnostics + [{"phase": "planning", "status": "complete",
+            "tasks": [_task_dict(task) for task in tasks],
+            "planning_uncertainty": {task.id: list(task.planning_uncertainty) for task in tasks},
+            "dependencies": {task.id: list(task.dependencies) for task in tasks}}]
+        recovery_start = next((i for i, item in enumerate(diagnostics) if item.get("phase") == "recovery"), len(diagnostics))
+        diagnostics[recovery_start:recovery_start] = support_diagnostics
         ordered = [verified[t.id] for t in tasks]
         answer_parts = [ta.answer for ta in ordered]
         final_answer = "\n".join(answer_parts)
@@ -427,6 +487,14 @@ def _failure_category(phase: str, status: str, failure_type: str) -> str:
         return "insufficient_evidence"
     if failure_type == "internal_execution_failure":
         return "internal_execution_failure"
+    if failure_type == "entity_resolution_failure":
+        return "entity_resolution_failure"
+    if failure_type in ("comparison_structure", "incomplete_comparison"):
+        return "incomplete_comparison"
+    if failure_type == "unjustified_abstention":
+        return "unjustified_abstention"
+    if failure_type == "unsupported_claim":
+        return "unsupported_claim"
     return "claim_verification_failure"
 
 
@@ -435,10 +503,11 @@ def _retry_action(failure_type: str) -> str:
         return "none"
     if failure_type in ("output_contract", "missing_evidence_reference", "invalid_citation",
                         "ambiguous_citation", "incorrect_fact_association", "comparison_structure",
-                        "entity_attribute_mismatch"):
+                        "incomplete_comparison", "missing_required_fact", "entity_attribute_mismatch",
+                        "entity_resolution_failure", "attribute_mismatch"):
         return "regenerate_from_existing_evidence"
     if failure_type == "insufficient_evidence":
         return "reformulate_retrieval_query"
-    if failure_type in ("unsupported_claim", "contradictory_evidence"):
+    if failure_type in ("unsupported_claim", "unjustified_abstention", "contradictory_evidence"):
         return "recheck_claim_against_existing_evidence"
     return "retry_with_existing_evidence"

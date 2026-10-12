@@ -261,18 +261,26 @@ def classify_verification_failure(reason: str) -> str:
     if any(term in value for term in ("missing evidence for required fact",
                                       "comparison is missing evidence for an operand")):
         return "missing_evidence_reference"
+    if any(term in value for term in ("required fact has no evidence-linked claim",
+                                      "required fact is not represented")):
+        return "missing_required_fact"
     if any(term in value for term in ("answer does not match", "outside its evidence-linked", "structured claim list")):
         return "output_contract"
+    if any(term in value for term in ("comparison claim is missing", "comparison conclusion is missing",
+                                      "comparison conclusion is unsupported")):
+        return "incomplete_comparison"
     if any(term in value for term in ("comparison claim", "comparison conclusion", "comparison is missing", "comparison omits")):
         return "comparison_structure"
     if any(term in value for term in ("chunk", "quote", "evidence reference", "citation")):
         return "invalid_citation"
     if any(term in value for term in ("entity", "subject", "attribute", "planner could not normalize")):
-        return "entity_attribute_mismatch"
+        return "entity_resolution_failure" if "entity" in value or "subject" in value else "attribute_mismatch"
     if any(term in value for term in ("conflicts", "contradict", "polarity")):
         return "contradictory_evidence"
     if "abstention is not justified" in value:
-        return "unsupported_claim"
+        return "unjustified_abstention"
+    if any(term in value for term in ("comparison claim is missing", "comparison conclusion", "comparison omits")):
+        return "incomplete_comparison"
     if any(term in value for term in ("unsupported", "not supported", "not express")):
         return "unsupported_claim"
     return "verification_failure"
@@ -461,14 +469,72 @@ def _entity_aliases(entity: str, supplied: Any = None) -> tuple[str, ...]:
     return aliases.get(entity, (entity.replace("_", " "),))
 
 
+def _normalize_entity_label(value: str) -> str:
+    """Normalize formatting only; this is exact identity matching, not fuzzy matching."""
+    return " ".join(re.findall(r"[\w]+", value.casefold(), re.UNICODE))
+
+
+def resolve_entity_alias(expected: str, observed: str, aliases: Any = None,
+                         evidence: list[str] | None = None) -> dict[str, str | bool]:
+    """Return a conservative entity match and its provenance for diagnostics."""
+    expected_norm, observed_norm = _normalize_entity_label(expected), _normalize_entity_label(observed)
+    if expected_norm and expected_norm == observed_norm:
+        return {"matched": True, "method": "normalized_canonical_name"}
+    for alias in _entity_aliases(expected, aliases):
+        alias_norm = _normalize_entity_label(alias)
+        if alias_norm and alias_norm == observed_norm:
+            return {"matched": True, "method": "explicit_planner_alias"}
+    # Accept a different surface form only when the evidence explicitly links
+    # the two names with an identity phrase. Substring overlap is insufficient.
+    names = [expected, observed] + list(_entity_aliases(expected, aliases))
+    norms = list(dict.fromkeys(n for n in (_normalize_entity_label(x) for x in names) if n))
+    markers = (r"\b(?:also known as|formerly known as|aka|a\.k\.a\.)\b",)
+    for quote in evidence or []:
+        q = _normalize_entity_label(quote)
+        if any(re.search(marker, quote, re.I) for marker in markers):
+            if sum(1 for name in norms if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", q)) >= 2:
+                return {"matched": True, "method": "explicit_identity_relation_in_evidence"}
+    return {"matched": False, "method": "unresolved"}
+
+
+def _evidence_linked_aliases(expected: str, evidence: list[str] | None, aliases: Any = None) -> set[str]:
+    result: set[str] = set()
+    canonical_names = [expected] + list(aliases or [])
+    for quote in evidence or []:
+        for canonical_name in canonical_names:
+            surface = re.sub(r"[_-]+", " ", canonical_name).strip()
+            if not surface:
+                continue
+            match = re.search(r"(?<!\w)" + re.escape(surface) + r"(?!\w)", quote, re.I)
+            if not match:
+                continue
+            after = quote[match.end():]
+            marker = re.match(r"\s*[,;(]?\s*(?:also known as|formerly known as|aka|a\.k\.a\.)\s*[,(:]?\s*([^,.;)]+)", after, re.I)
+            if marker:
+                alias = marker.group(1).strip(" '\"`:")
+                if alias and _normalize_entity_label(alias) != _normalize_entity_label(surface):
+                    result.add(alias)
+    return result
+
+
+def _claim_text_mentions_entity(entity: str, text: str, aliases: Any,
+                                evidence: list[str] | None) -> bool:
+    normalized_text = _normalize_entity_label(text)
+    return _mentions_entity(entity, text, aliases) or any(
+        bool(_normalize_entity_label(alias)) and re.search(
+            r"(?<!\w)" + re.escape(_normalize_entity_label(alias)) + r"(?!\w)", normalized_text)
+        for alias in _evidence_linked_aliases(entity, evidence, aliases))
+
+
 def _mentions_entity(entity: str, text: str, aliases: Any = None) -> bool:
     if entity == "comparison":
         return True
     if entity in ("unknown", "unresolved"):
         return False
-    lower = text.lower()
-    return any(re.search(r"\b" + re.escape(alias.lower()) + r"\b", lower)
-               for alias in _entity_aliases(entity, aliases))
+    normalized_text = _normalize_entity_label(text)
+    return any(bool(alias_norm) and re.search(r"(?<!\w)" + re.escape(alias_norm) + r"(?!\w)", normalized_text)
+               for alias in _entity_aliases(entity, aliases)
+               for alias_norm in (_normalize_entity_label(alias),))
 
 
 def _attribute_supported(attribute: str, quote: str) -> bool:
@@ -499,6 +565,29 @@ def _attribute_supported(attribute: str, quote: str) -> bool:
         return bool(re.search(r"\b(is|are|means|category|allows|refers|defined)\b", q))
     if attribute == "director":
         return bool(re.search(r"\b(director|directed|directs|direct|filmmaker)\b", q))
+    if attribute == "birth_date":
+        return bool(re.search(r"\b(born|birth|\d{4}|\d{1,2}\s+[a-z]+\s+\d{4})\b", q, re.I))
+    if attribute == "age":
+        return bool(re.search(r"\b(?:\d+\s+years?\s+old|aged\s+\d+|born\s+(?:in\s+)?\d{4})\b", q, re.I))
+    if attribute == "member_count":
+        return bool(re.search(r"\b(member|members|lineup|consists of|comprised of)\b", q))
+    if attribute == "occupation":
+        return bool(re.search(r"\b(occupation|worked as|is an? |was an? |profession|job|editor|director|writer|engineer|teacher|actor|producer|cinematographer)\b", q))
+    if attribute == "level":
+        return bool(re.search(r"\b(level|county-level|municipal|administrative division|tier)\b", q))
+    if attribute == "ingredient":
+        return bool(re.search(r"\b(contains?|contain|made with|ingredient|includes?)\b", q))
+    if attribute == "ratio":
+        return bool(re.search(r"\b(ratio|per person|instrument|musician)\b", q))
+    if attribute == "population":
+        return bool(re.search(r"\b(population|inhabitants|people live|residents)\b", q)
+                    and bool(re.search(r"\b\d[\d,]*\b", q)))
+    if attribute == "name":
+        return bool(re.search(r"\b(name|called|titled|song is)\b", q))
+    if attribute == "classification":
+        return bool(re.search(r"\b(genus|species|classified as|described as|is a|is an|are a|are an)\b", q))
+    if attribute == "origin":
+        return bool(re.search(r"\b(from|originated|native to|born in)\b", q))
     if attribute == "premiere_date":
         return (bool(re.search(r"\b(premiere|premiered|release date|released)\b", q))
                 and bool(re.search(r"\b(?:\d{1,2}[/.-]\d{1,2}|\d{4}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b", q)))
@@ -602,6 +691,37 @@ def _comparison_value(attribute: str, quotes: list[str]) -> str | None:
         values = [re.sub(r"\s+(?:neighbou?rhood|district)$", "", value, flags=re.I).strip().casefold()
                   for value in matches if value.strip()]
         return values[-1] if values else None
+    if attribute in ("birth_date", "age", "population", "member_count", "ratio"):
+        if attribute == "member_count":
+            match = re.search(r"\b(?:have|has|had|with|consists of)\s+(\d+)\s+members?\b", text, re.I)
+        elif attribute == "population":
+            match = re.search(r"\bpopulation\b[^\d]{0,30}(\d[\d,]*)", text, re.I)
+        elif attribute == "ratio":
+            match = re.search(r"\b(?:ratio|rate)\b[^\d]{0,30}(\d+(?:\.\d+)?)", text, re.I)
+        elif attribute == "age":
+            match = re.search(r"\b(?:aged\s+|age\s+(?:of\s+)?)(\d+)\b", text, re.I)
+            if not match:
+                match = re.search(r"\bborn\b[^.!?]{0,50}\b(\d{4})\b", text, re.I)
+        else:
+            match = re.search(r"\bborn\b[^.!?]{0,50}\b(\d{4})\b", text, re.I)
+            if not match:
+                match = re.search(r"\b(\d{4})\b", text)
+        return match.group(1).replace(",", "") if match else None
+    if attribute == "classification":
+        values = re.findall(r"\b(genus|genera|species|family|order|class)\b", text, re.I)
+        return values[-1].casefold() if values else None
+    if attribute == "ingredient":
+        match = re.search(r"\b(?:contains?|made with|ingredient[s]?:?)\s+([^,.;]+)", text, re.I)
+        return match.group(1).strip().casefold() if match else None
+    if attribute == "occupation":
+        values = re.findall(r"\b(editor|director|writer|engineer|teacher|actor|producer|doctor|lawyer|musician|composer|professor)\b", text, re.I)
+        return ",".join(sorted(set(value.casefold() for value in values))) if values else None
+    if attribute == "level":
+        match = re.search(r"\b([\w-]+-level|city-level|county-level)\b", text, re.I)
+        return match.group(1).casefold() if match else None
+    if attribute == "origin":
+        match = re.search(r"\b(?:from|originated in|native to)\s+([^,.;]+)", text, re.I)
+        return match.group(1).strip().casefold() if match else None
     return None
 
 
@@ -609,6 +729,60 @@ def _comparison_conclusion_matches(comparison: dict[str, Any], answer: str,
                                    left_quotes: list[str], right_quotes: list[str]) -> bool:
     kind, operator = str(comparison.get("kind", "duration")), str(comparison.get("operator", ""))
     statement = answer.casefold()
+    if kind == "shared_property":
+        required = re.findall(r"[\w]+", str(comparison.get("required_value", "")).casefold())
+        stop = {"a", "an", "the", "as", "is", "are", "both", "contain", "contains", "classified", "described"}
+        required = [word for word in required if word not in stop]
+        def has_property(quotes: list[str]) -> bool:
+            source = " ".join(quotes).casefold()
+            return bool(required) and all(
+                re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", source) or
+                (word in ("genus", "genera") and re.search(r"\b(?:genus|genera)\b", source))
+                for word in required)
+        statement_has_property = all(
+            re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", statement) or
+            (word in ("genus", "genera") and re.search(r"\b(?:genus|genera)\b", statement)) for word in required)
+        return (bool(required) and has_property(left_quotes) and has_property(right_quotes)
+                and statement_has_property and bool(re.search(r"\b(both|share|same)\b", statement)))
+
+    if kind == "shared_attribute":
+        left_shared = set((_comparison_value(str(comparison.get("attribute", "")), left_quotes) or "").split(","))
+        right_shared = set((_comparison_value(str(comparison.get("attribute", "")), right_quotes) or "").split(","))
+        shared = (left_shared & right_shared) - {""}
+        return bool(shared and re.search(r"\b(share|same|both)\b", statement))
+
+    if kind in ("rank", "temporal"):
+        left_raw = _comparison_value(str(comparison.get("attribute", "")), left_quotes)
+        right_raw = _comparison_value(str(comparison.get("attribute", "")), right_quotes)
+        if left_raw is None or right_raw is None:
+            return False
+        try:
+            left_value, right_value = float(left_raw), float(right_raw)
+        except ValueError:
+            return False
+        if left_value == right_value:
+            return bool(re.search(r"\b(equal|same|tie)\b", statement))
+        maximize = operator in ("more", "higher", "later", "older")
+        left_preferred = left_value > right_value if maximize else left_value < right_value
+        preferred = str(comparison.get("left_label" if left_preferred else "right_label", ""))
+        other = str(comparison.get("right_label" if left_preferred else "left_label", ""))
+        preferred_norm, other_norm = _normalize_entity_label(preferred), _normalize_entity_label(other)
+        preferred_pos = statement.find(preferred_norm)
+        other_pos = statement.find(other_norm)
+        if preferred_pos < 0 or other_pos < 0:
+            return False
+        direction = {"more": ("more", "greater", "higher", "larger"),
+                     "fewer": ("fewer", "less", "lower"),
+                     "less": ("less", "lower", "fewer"),
+                     "higher": ("higher", "greater", "more"),
+                     "lower": ("lower", "less", "fewer"),
+                     "earlier": ("earlier", "before"), "later": ("later", "after"),
+                     "younger": ("younger",), "older": ("older",)}.get(operator, ())
+        comparator_positions = [statement.find(word) for word in direction if statement.find(word) >= 0]
+        if not comparator_positions:
+            return False
+        middle = statement[min(preferred_pos, other_pos):max(preferred_pos, other_pos) + len(other_norm)]
+        return any(word in middle for word in direction) and preferred_pos < other_pos
     if kind == "duration":
         pattern = re.compile(r"\b(\d+)(?:\s*-\s*(\d+))?\s+business days?\b", re.I)
         def bounds(quotes: list[str]):
@@ -700,15 +874,22 @@ def _verify_claims(task: dict[str, Any], answer: str, claims: list[Any],
             if not fact.get("verifiable", False):
                 return EvidenceVerification("needs_retry", answer, valid_refs,
                                             "Planner could not normalize required fact; refusing to certify supported claim", [fid])
-            if not comparison_claim and (entity != expected_entity or attribute != expected_attribute):
+            if not comparison_claim and attribute != expected_attribute:
                 return EvidenceVerification("needs_retry", answer, valid_refs,
                                             "Claim entity or attribute does not match required fact")
-            if not _mentions_entity(expected_entity, quote, fact.get("entity_aliases")):
+            claim_quotes = [str(item.get("quote", "")) for item in refs if isinstance(item, dict)]
+            if not comparison_claim and not resolve_entity_alias(expected_entity, entity,
+                    fact.get("entity_aliases"), claim_quotes)["matched"]:
+                return EvidenceVerification("needs_retry", answer, valid_refs,
+                                            "Claim entity or attribute/subject does not match required fact or evidence-supported alias")
+            if (not _mentions_entity(expected_entity, quote, fact.get("entity_aliases")) and
+                    not resolve_entity_alias(expected_entity, entity, fact.get("entity_aliases"), [quote])["matched"]):
                 return EvidenceVerification("needs_retry", answer, valid_refs,
                                             "Claim subject does not match evidence subject")
-            if not comparison_claim and not _mentions_entity(expected_entity, text, fact.get("entity_aliases")):
+            if (not comparison_claim and not _claim_text_mentions_entity(expected_entity, text,
+                    fact.get("entity_aliases"), claim_quotes)):
                 return EvidenceVerification("needs_retry", answer, valid_refs,
-                                            "Claim text subject does not match required entity")
+                                            "Claim text subject/entity does not match required entity")
             if not comparison_claim and not _attribute_supported(expected_attribute, quote):
                 return EvidenceVerification("needs_retry", answer, valid_refs,
                                             "Evidence does not contain the required attribute")
